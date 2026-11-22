@@ -24,16 +24,28 @@ const normalizeRoomId = (input?: string): string => {
     return clean;
 };
 
-// Resilient STUN configuration for NAT traversal between mobile 4G/5G and Wi-Fi networks
+// Resilient ICE configuration with STUN and TURN relay servers for cross-network (mobile 4G/5G vs Wi-Fi) WebRTC
 const ICE_SERVERS: RTCConfiguration = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
         { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:stun3.l.google.com:19302" },
-        { urls: "stun:stun4.l.google.com:19302" },
         { urls: "stun:stun.relay.metered.ca:80" },
-        { urls: "stun:global.stun.twilio.com:3478" }
+        {
+            urls: "turn:openrelay.metered.ca:80",
+            username: "openrelayproject",
+            credential: "openrelayproject"
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443",
+            username: "openrelayproject",
+            credential: "openrelayproject"
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443?transport=tcp",
+            username: "openrelayproject",
+            credential: "openrelayproject"
+        }
     ],
     iceCandidatePoolSize: 10
 };
@@ -45,31 +57,67 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
     const [audioBlocked, setAudioBlocked] = useState(false);
     const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
 
-    useEffect(() => {
+    // Sync MediaStream to DOM video and audio elements
+    const syncStream = () => {
         if (!stream) {
             setHasRemoteVideo(false);
             return;
         }
 
-        const videoTracks = stream.getVideoTracks();
-        setHasRemoteVideo(videoTracks.length > 0 && videoTracks[0].enabled);
+        const vTracks = stream.getVideoTracks();
+        const isVideoLive = vTracks.length > 0 && vTracks.some((t) => t.enabled && t.readyState === "live");
+        setHasRemoteVideo(isVideoLive || vTracks.length > 0);
 
-        if (videoRef.current) {
+        if (videoRef.current && videoRef.current.srcObject !== stream) {
             videoRef.current.srcObject = stream;
             videoRef.current.play().catch((err) => {
-                console.warn("Peer video autoplay was prevented:", err);
+                console.warn("Peer video autoplay prevented:", err);
             });
         }
 
-        if (audioRef.current) {
+        if (audioRef.current && audioRef.current.srcObject !== stream) {
             audioRef.current.srcObject = stream;
             audioRef.current.play().then(() => {
                 setAudioBlocked(false);
             }).catch((err) => {
-                console.warn("Peer audio autoplay was blocked by browser:", err);
+                console.warn("Peer audio autoplay blocked by browser:", err);
                 setAudioBlocked(true);
             });
         }
+    };
+
+    useEffect(() => {
+        syncStream();
+
+        if (!stream) return;
+
+        const handleTrackUpdate = () => {
+            syncStream();
+        };
+
+        stream.addEventListener("addtrack", handleTrackUpdate);
+        stream.addEventListener("removetrack", handleTrackUpdate);
+
+        const tracks = stream.getTracks();
+        tracks.forEach((t) => {
+            t.addEventListener("mute", handleTrackUpdate);
+            t.addEventListener("unmute", handleTrackUpdate);
+            t.addEventListener("ended", handleTrackUpdate);
+        });
+
+        // Periodic check to capture video frames as soon as ICE connection settles
+        const intervalId = setInterval(syncStream, 1500);
+
+        return () => {
+            clearInterval(intervalId);
+            stream.removeEventListener("addtrack", handleTrackUpdate);
+            stream.removeEventListener("removetrack", handleTrackUpdate);
+            tracks.forEach((t) => {
+                t.removeEventListener("mute", handleTrackUpdate);
+                t.removeEventListener("unmute", handleTrackUpdate);
+                t.removeEventListener("ended", handleTrackUpdate);
+            });
+        };
     }, [stream]);
 
     const handleEnableAudio = () => {
@@ -86,19 +134,22 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
             {/* Dedicated HTML5 audio tag for clear speaker output */}
             <audio ref={audioRef} autoPlay playsInline />
 
-            {stream && hasRemoteVideo ? (
-                <video 
-                    ref={videoRef} 
-                    autoPlay 
-                    playsInline 
-                    className="w-full h-full object-cover"
-                />
-            ) : (
+            {/* Video element is ALWAYS mounted to prevent React DOM unmounting race conditions */}
+            <video 
+                ref={videoRef} 
+                autoPlay 
+                playsInline 
+                muted={false}
+                className={`w-full h-full object-cover ${hasRemoteVideo && stream ? "block" : "hidden"}`}
+            />
+
+            {/* Avatar placeholder shown when video is inactive, camera is off, or stream is connecting */}
+            {(!hasRemoteVideo || !stream) && (
                 <div className="text-center space-y-2">
                     <div className="w-16 h-16 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-400 font-extrabold text-lg flex items-center justify-center mx-auto">
                         {peer.user?.fullName?.charAt(0).toUpperCase() || "P"}
                     </div>
-                    <span className="text-xs text-neutral-400 block">{peer.user?.fullName}</span>
+                    <span className="text-xs text-neutral-400 block">{peer.user?.fullName || "Peer"}</span>
                     <span className="text-[10px] text-neutral-500 block">
                         {stream ? "Audio only" : "Connecting..."}
                     </span>
@@ -149,8 +200,11 @@ export default function MeetingRoom() {
     const [liveCaptionText, setLiveCaptionText] = useState("AI Voice Assistant: Listening to conversation...");
     const [isTranscribing, setIsTranscribing] = useState(false);
     const recognitionRef = useRef<any>(null);
+    const isInMeetingRef = useRef<boolean>(false);
+    const micEnabledRef = useRef<boolean>(true);
 
     // Media stream references
+    const lobbyVideoRef = useRef<HTMLVideoElement>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const localStreamRef = useRef<MediaStream | null>(null);
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -160,6 +214,15 @@ export default function MeetingRoom() {
     const iceCandidatesQueue = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
     const [peers, setPeers] = useState<{ socketId: string; user: any }[]>([]);
     const [remoteStreams, setRemoteStreams] = useState<{ [socketId: string]: MediaStream }>({});
+
+    // Keep state refs in sync
+    useEffect(() => {
+        isInMeetingRef.current = !inLobby;
+    }, [inLobby]);
+
+    useEffect(() => {
+        micEnabledRef.current = micEnabled;
+    }, [micEnabled]);
 
     // 1. Camera & Microphone Initialization
     const startCamera = async () => {
@@ -181,18 +244,34 @@ export default function MeetingRoom() {
                 });
             } catch (bothErr) {
                 console.warn("Could not access video+audio together, trying video only:", bothErr);
-                stream = await navigator.mediaDevices.getUserMedia({
-                    video: true,
-                    audio: false
-                });
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: true,
+                        audio: false
+                    });
+                } catch (vidErr) {
+                    console.warn("Could not access video, trying audio only:", vidErr);
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: false,
+                        audio: true
+                    });
+                }
             }
 
             localStreamRef.current = stream;
             setLocalStream(stream);
-            setCamEnabled(true);
+
+            const hasVideo = stream.getVideoTracks().length > 0 && stream.getVideoTracks()[0].enabled;
+            setCamEnabled(hasVideo);
+
             const hasAudio = stream.getAudioTracks().length > 0 && stream.getAudioTracks()[0].enabled;
             setMicEnabled(hasAudio);
+            micEnabledRef.current = hasAudio;
 
+            if (lobbyVideoRef.current) {
+                lobbyVideoRef.current.srcObject = stream;
+                lobbyVideoRef.current.play().catch(() => {});
+            }
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = stream;
                 localVideoRef.current.play().catch(() => {});
@@ -203,7 +282,7 @@ export default function MeetingRoom() {
                 stream.getTracks().forEach((track) => {
                     const sender = pc.getSenders().find((s) => s.track?.kind === track.kind);
                     if (sender) {
-                        sender.replaceTrack(track);
+                        sender.replaceTrack(track).catch(console.warn);
                     } else {
                         pc.addTrack(track, stream);
                     }
@@ -215,6 +294,8 @@ export default function MeetingRoom() {
             console.error("Camera access failed completely:", err);
             toast.error("Could not access camera/mic. Please check browser permissions.");
             setCamEnabled(false);
+            setMicEnabled(false);
+            micEnabledRef.current = false;
             return null;
         }
     };
@@ -224,6 +305,9 @@ export default function MeetingRoom() {
             localStreamRef.current.getTracks().forEach((track) => track.stop());
             localStreamRef.current = null;
             setLocalStream(null);
+        }
+        if (lobbyVideoRef.current) {
+            lobbyVideoRef.current.srcObject = null;
         }
         if (localVideoRef.current) {
             localVideoRef.current.srcObject = null;
@@ -238,9 +322,21 @@ export default function MeetingRoom() {
         };
     }, []);
 
-    // Reattach localStream whenever localVideoRef element re-mounts (e.g. Lobby -> Room transition)
+    // Sync stream to lobby preview video
     useEffect(() => {
-        if (localVideoRef.current) {
+        if (inLobby && lobbyVideoRef.current) {
+            if (localStream && camEnabled) {
+                lobbyVideoRef.current.srcObject = localStream;
+                lobbyVideoRef.current.play().catch(() => {});
+            } else {
+                lobbyVideoRef.current.srcObject = null;
+            }
+        }
+    }, [localStream, inLobby, camEnabled]);
+
+    // Sync stream to active meeting room video
+    useEffect(() => {
+        if (!inLobby && localVideoRef.current) {
             if (localStream && camEnabled) {
                 localVideoRef.current.srcObject = localStream;
                 localVideoRef.current.play().catch(() => {});
@@ -301,11 +397,18 @@ export default function MeetingRoom() {
         const pc = new RTCPeerConnection(ICE_SERVERS);
         peersRef.current.set(targetSocketId, pc);
 
-        // Add local tracks (both video & audio) to peer connection
-        if (localStreamRef.current) {
+        // Add local tracks to peer connection
+        if (localStreamRef.current && localStreamRef.current.getTracks().length > 0) {
             localStreamRef.current.getTracks().forEach((track) => {
                 pc.addTrack(track, localStreamRef.current!);
             });
+        } else {
+            try {
+                pc.addTransceiver("video", { direction: "sendrecv" });
+                pc.addTransceiver("audio", { direction: "sendrecv" });
+            } catch (e) {
+                console.warn("Transceiver initialization notice:", e);
+            }
         }
 
         // Send gathered ICE candidate to peer
@@ -320,33 +423,47 @@ export default function MeetingRoom() {
 
         // Receive remote track (combines both audio and video into unified MediaStream)
         pc.ontrack = (event) => {
-            console.log(`📡 Remote track received from ${targetSocketId}:`, event.track.kind);
+            console.log(`📡 Remote track received from ${targetSocketId}:`, event.track.kind, event.track.id);
             setRemoteStreams((prev) => {
                 const existing = prev[targetSocketId];
+                let updatedStream: MediaStream;
+
                 if (existing) {
                     if (!existing.getTracks().some((t) => t.id === event.track.id)) {
                         existing.addTrack(event.track);
                     }
-                    return {
-                        ...prev,
-                        [targetSocketId]: new MediaStream(existing.getTracks())
-                    };
+                    if (event.streams && event.streams[0]) {
+                        event.streams[0].getTracks().forEach((t) => {
+                            if (!existing.getTracks().some((et) => et.id === t.id)) {
+                                existing.addTrack(t);
+                            }
+                        });
+                    }
+                    updatedStream = new MediaStream(existing.getTracks());
                 } else {
-                    const newStream = event.streams && event.streams[0]
-                        ? new MediaStream(event.streams[0].getTracks())
-                        : new MediaStream([event.track]);
-                    return {
-                        ...prev,
-                        [targetSocketId]: newStream
-                    };
+                    if (event.streams && event.streams[0]) {
+                        updatedStream = new MediaStream(event.streams[0].getTracks());
+                    } else {
+                        updatedStream = new MediaStream([event.track]);
+                    }
                 }
+
+                return {
+                    ...prev,
+                    [targetSocketId]: updatedStream
+                };
             });
         };
 
         pc.oniceconnectionstatechange = () => {
             console.log(`🧊 ICE State with ${targetSocketId}:`, pc.iceConnectionState);
             if (pc.iceConnectionState === "failed") {
-                pc.restartIce();
+                console.warn(`ICE failed with ${targetSocketId}, restarting ICE...`);
+                try {
+                    pc.restartIce();
+                } catch (e) {
+                    console.warn("restartIce error:", e);
+                }
             }
         };
 
@@ -373,11 +490,17 @@ export default function MeetingRoom() {
         if (!roomId) return;
         const cleanRoomId = normalizeRoomId(roomId);
         setInLobby(false);
+        isInMeetingRef.current = true;
 
         // Ensure camera & mic stream is acquired BEFORE creating peer connections
         let currentStream = localStreamRef.current;
         if (!currentStream) {
             currentStream = await startCamera();
+        }
+
+        // Start continuous speech recognition directly from button click gesture
+        if (micEnabled) {
+            startSpeechRecognition();
         }
 
         const safeUser = user || {
@@ -508,25 +631,27 @@ export default function MeetingRoom() {
         });
 
         socket.on("receive-message", (msg: ChatItem) => {
-            setMessages((prev) => [...prev, msg]);
+            setMessages((prev) => {
+                if (prev.some((m) => m.sender === msg.sender && m.text === msg.text && Math.abs(new Date(m.timestamp).getTime() - new Date(msg.timestamp).getTime()) < 3000)) {
+                    return prev;
+                }
+                return [...prev, msg];
+            });
         });
 
         socket.on("receive-transcript", (transcript: TranscriptItem) => {
-            setTranscripts((prev) => [...prev, transcript]);
+            setTranscripts((prev) => {
+                if (prev.some((t) => t.sender === transcript.sender && t.text === transcript.text && Math.abs(new Date(t.timestamp).getTime() - new Date(transcript.timestamp).getTime()) < 3000)) {
+                    return prev;
+                }
+                return [...prev, transcript];
+            });
             setLiveCaptionText(`${transcript.sender}: ${transcript.text}`);
         });
 
         socket.on("user-typing", ({ userName, isTyping }) => {
             setTypingUser(isTyping ? userName : "");
         });
-
-        const botTimer = setTimeout(() => {
-            simulateTeammateTalk();
-        }, 15000);
-
-        return () => {
-            clearTimeout(botTimer);
-        };
     };
 
     // Clean up sockets & WebRTC peers on unmount
@@ -560,21 +685,30 @@ export default function MeetingRoom() {
 
         try {
             if (recognitionRef.current) {
-                try { recognitionRef.current.abort(); } catch (e) {}
+                try {
+                    recognitionRef.current.abort();
+                } catch (e) {}
+                recognitionRef.current = null;
             }
 
             const recognition = new SpeechRecognition();
             recognition.continuous = true;
-            recognition.interimResults = false;
+            recognition.interimResults = true;
             recognition.lang = "en-US";
+            recognition.maxAlternatives = 1;
 
             recognition.onresult = (event: any) => {
+                let interimStr = "";
                 for (let i = event.resultIndex; i < event.results.length; ++i) {
-                    if (event.results[i].isFinal) {
-                        const spokenText = event.results[i][0].transcript.trim();
-                        if (spokenText && roomId && user) {
+                    const result = event.results[i];
+                    const transcriptPiece = result[0]?.transcript || "";
+
+                    if (result.isFinal) {
+                        const spokenText = transcriptPiece.trim();
+                        if (spokenText && roomId) {
+                            const senderName = user?.fullName || "Participant";
                             const item: TranscriptItem = {
-                                sender: user.fullName || "Speaker",
+                                sender: senderName,
                                 text: spokenText,
                                 timestamp: new Date().toISOString()
                             };
@@ -586,12 +720,25 @@ export default function MeetingRoom() {
                             });
 
                             // Persist to MongoDB under user's name
-                            addTranscriptMessage(roomId, user.fullName || "Speaker", spokenText);
+                            addTranscriptMessage(roomId, senderName, spokenText);
 
-                            setTranscripts((prev) => [...prev, item]);
-                            setLiveCaptionText(`${user.fullName || "Speaker"}: ${spokenText}`);
+                            setTranscripts((prev) => {
+                                if (prev.some((t) => t.sender === item.sender && t.text === item.text && Math.abs(new Date(t.timestamp).getTime() - new Date(item.timestamp).getTime()) < 3000)) {
+                                    return prev;
+                                }
+                                return [...prev, item];
+                            });
+
+                            setLiveCaptionText(`${senderName}: ${spokenText}`);
                         }
+                    } else {
+                        interimStr += transcriptPiece;
                     }
+                }
+
+                if (interimStr.trim()) {
+                    const senderName = user?.fullName || "You";
+                    setLiveCaptionText(`${senderName}: ${interimStr.trim()}...`);
                 }
             };
 
@@ -599,15 +746,23 @@ export default function MeetingRoom() {
                 if (event.error !== "no-speech") {
                     console.warn("Speech recognition notice:", event.error);
                 }
+                if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+                    setIsTranscribing(false);
+                }
             };
 
             recognition.onend = () => {
-                if (!inLobby && micEnabled && recognitionRef.current) {
-                    try {
-                        recognition.start();
-                    } catch (e) {
-                        // ignore restart collision
-                    }
+                if (isInMeetingRef.current && micEnabledRef.current) {
+                    setTimeout(() => {
+                        if (isInMeetingRef.current && micEnabledRef.current && recognitionRef.current) {
+                            try {
+                                recognition.start();
+                                setIsTranscribing(true);
+                            } catch (e) {
+                                // Ignore restart collision
+                            }
+                        }
+                    }, 300);
                 } else {
                     setIsTranscribing(false);
                 }
@@ -644,32 +799,16 @@ export default function MeetingRoom() {
         };
     }, [inLobby, micEnabled]);
 
-    // 5. Simulate other participants talking if alone
-    const simulateTeammateTalk = () => {
-        if (peers.length === 0) {
-            const simulatedTalks = [
-                { sender: "AI Guide", text: "Hey! I will help summarize our progress. Let's make sure we discuss the database config." },
-                { sender: "Sarah (Product)", text: "I will take care of the landing page illustrations this afternoon." },
-                { sender: "James (Backend)", text: "Sure, and I need to deploy the Redis clusters to Kubernetes on Day 5." }
-            ];
-
-            simulatedTalks.forEach((talk, idx) => {
-                setTimeout(() => {
-                    const item: TranscriptItem = { sender: talk.sender, text: talk.text, timestamp: new Date().toISOString() };
-                    setTranscripts((prev) => [...prev, item]);
-                    setLiveCaptionText(`${talk.sender}: ${talk.text}`);
-                    if (roomId) {
-                        addTranscriptMessage(roomId, talk.sender, talk.text);
-                    }
-                }, (idx + 1) * 8000);
-            });
-        }
-    };
-
     // 5. Mute & Camera Toggles
     const toggleMic = () => {
         if (!localStreamRef.current || localStreamRef.current.getAudioTracks().length === 0) {
-            setMicEnabled(!micEnabled);
+            const nextState = !micEnabled;
+            setMicEnabled(nextState);
+            micEnabledRef.current = nextState;
+            if (!inLobby) {
+                if (nextState) startSpeechRecognition();
+                else stopSpeechRecognition();
+            }
             return;
         }
 
@@ -678,9 +817,20 @@ export default function MeetingRoom() {
             const nextState = !micEnabled;
             audioTrack.enabled = nextState;
             setMicEnabled(nextState);
+            micEnabledRef.current = nextState;
+            if (!inLobby) {
+                if (nextState) startSpeechRecognition();
+                else stopSpeechRecognition();
+            }
             toast.success(nextState ? "Microphone enabled" : "Microphone muted");
         } else {
-            setMicEnabled(!micEnabled);
+            const nextState = !micEnabled;
+            setMicEnabled(nextState);
+            micEnabledRef.current = nextState;
+            if (!inLobby) {
+                if (nextState) startSpeechRecognition();
+                else stopSpeechRecognition();
+            }
         }
     };
 
@@ -764,35 +914,42 @@ export default function MeetingRoom() {
     // 6. Typing and Chat Handlers
     const handleChatChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         setChatInput(e.target.value);
-        if (!roomId || !user) return;
+        if (!roomId) return;
 
-        socket.emit("typing", { roomId, userName: user.fullName, isTyping: true });
+        const senderName = user?.fullName || "Participant";
+        socket.emit("typing", { roomId: normalizeRoomId(roomId), userName: senderName, isTyping: true });
 
         if (typingTimeout) clearTimeout(typingTimeout);
         
         setTypingTimeout(
             setTimeout(() => {
-                socket.emit("typing", { roomId, userName: user.fullName, isTyping: false });
+                socket.emit("typing", { roomId: normalizeRoomId(roomId), userName: senderName, isTyping: false });
             }, 1500)
         );
     };
 
     const handleSendChat = (e: React.FormEvent) => {
         e.preventDefault();
-        if (!chatInput.trim() || !roomId || !user) return;
+        if (!chatInput.trim() || !roomId) return;
 
+        const senderName = user?.fullName || "Participant";
         const messageData: ChatItem = {
-            sender: user.fullName,
+            sender: senderName,
             text: chatInput.trim(),
             timestamp: new Date().toISOString()
         };
 
         socket.emit("send-message", { roomId: normalizeRoomId(roomId), message: messageData });
-        addChatMessage(roomId, user.fullName, chatInput.trim());
+        addChatMessage(roomId, senderName, chatInput.trim());
 
-        setMessages((prev) => [...prev, messageData]);
+        setMessages((prev) => {
+            if (prev.some((m) => m.sender === senderName && m.text === messageData.text && Math.abs(new Date(m.timestamp).getTime() - new Date(messageData.timestamp).getTime()) < 3000)) {
+                return prev;
+            }
+            return [...prev, messageData];
+        });
 
-        socket.emit("typing", { roomId: normalizeRoomId(roomId), userName: user.fullName, isTyping: false });
+        socket.emit("typing", { roomId: normalizeRoomId(roomId), userName: senderName, isTyping: false });
         if (typingTimeout) clearTimeout(typingTimeout);
 
         setChatInput("");
@@ -801,10 +958,11 @@ export default function MeetingRoom() {
     // 7. Live Voice Transcription submit (manual dictation fallback)
     const handleAddLiveSpeech = (e: React.FormEvent) => {
         e.preventDefault();
-        if (!captionInput.trim() || !roomId || !user) return;
+        if (!captionInput.trim() || !roomId) return;
 
+        const senderName = user?.fullName || "Participant";
         const transcriptItem: TranscriptItem = {
-            sender: user.fullName,
+            sender: senderName,
             text: captionInput.trim(),
             timestamp: new Date().toISOString()
         };
@@ -814,10 +972,15 @@ export default function MeetingRoom() {
             transcript: transcriptItem
         });
 
-        addTranscriptMessage(roomId, user.fullName, captionInput.trim());
+        addTranscriptMessage(roomId, senderName, captionInput.trim());
 
-        setTranscripts((prev) => [...prev, transcriptItem]);
-        setLiveCaptionText(`${user.fullName}: ${captionInput.trim()}`);
+        setTranscripts((prev) => {
+            if (prev.some((t) => t.sender === senderName && t.text === transcriptItem.text && Math.abs(new Date(t.timestamp).getTime() - new Date(transcriptItem.timestamp).getTime()) < 3000)) {
+                return prev;
+            }
+            return [...prev, transcriptItem];
+        });
+        setLiveCaptionText(`${senderName}: ${captionInput.trim()}`);
         setCaptionInput("");
         toast.success("Voice transcript saved under your name", { icon: "🎙️" });
     };
@@ -826,6 +989,7 @@ export default function MeetingRoom() {
     const handleLeaveMeeting = () => {
         socket.disconnect();
         stopCamera();
+        stopSpeechRecognition();
         peersRef.current.forEach((pc) => pc.close());
         peersRef.current.clear();
         iceCandidatesQueue.current.clear();
@@ -840,6 +1004,7 @@ export default function MeetingRoom() {
 
         try {
             stopCamera();
+            stopSpeechRecognition();
             peersRef.current.forEach((pc) => pc.close());
             peersRef.current.clear();
             iceCandidatesQueue.current.clear();
@@ -862,15 +1027,15 @@ export default function MeetingRoom() {
                     <div className="flex-1 space-y-4">
                         <h2 className="text-xl font-bold">Lobby Hardware Setup</h2>
                         <div className="aspect-video w-full rounded-2xl bg-black/60 border border-white/5 relative overflow-hidden flex items-center justify-center">
-                            {camEnabled && localStream ? (
-                                <video 
-                                    ref={localVideoRef} 
-                                    autoPlay 
-                                    playsInline 
-                                    muted 
-                                    className="w-full h-full object-cover scale-x-[-1]"
-                                />
-                            ) : (
+                            {/* Keep lobby video element always in DOM to preserve stream binding */}
+                            <video 
+                                ref={lobbyVideoRef} 
+                                autoPlay 
+                                playsInline 
+                                muted 
+                                className={`w-full h-full object-cover scale-x-[-1] ${camEnabled && localStream ? "block" : "hidden"}`}
+                            />
+                            {(!camEnabled || !localStream) && (
                                 <div className="text-center space-y-2">
                                     <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mx-auto text-neutral-400">
                                         <VideoOff className="w-6 h-6" />
@@ -1010,15 +1175,14 @@ export default function MeetingRoom() {
                     <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 items-center justify-center min-h-[300px]">
                         {/* Tile 1: Local Stream */}
                         <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center group">
-                            {camEnabled && localStream ? (
-                                <video 
-                                    ref={localVideoRef} 
-                                    autoPlay 
-                                    playsInline 
-                                    muted 
-                                    className="w-full h-full object-cover scale-x-[-1]"
-                                />
-                            ) : (
+                            <video 
+                                ref={localVideoRef} 
+                                autoPlay 
+                                playsInline 
+                                muted 
+                                className={`w-full h-full object-cover scale-x-[-1] ${camEnabled && localStream ? "block" : "hidden"}`}
+                            />
+                            {(!camEnabled || !localStream) && (
                                 <div className="text-center space-y-1">
                                     <div className="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center mx-auto text-neutral-500">
                                         <VideoOff className="w-5 h-5" />
