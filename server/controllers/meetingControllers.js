@@ -181,7 +181,14 @@ exports.getMeetingDetails = async (req, res) => {
 exports.updateMeetingTranscript = async (req, res) => {
     try {
         const { roomId } = req.params;
-        const { sender, text } = req.body;
+        const { sender, text, timestamp } = req.body;
+
+        if (!text || !text.trim()) {
+            return res.status(400).json({
+                success: false,
+                message: "Transcript text cannot be empty"
+            });
+        }
 
         const meeting = await findMeetingByRoomId(roomId);
         if (!meeting) {
@@ -191,11 +198,66 @@ exports.updateMeetingTranscript = async (req, res) => {
             });
         }
 
-        meeting.transcript.push({ sender, text, timestamp: new Date() });
+        const transcriptEntry = {
+            sender: sender || req.user?.fullName || "Speaker",
+            senderUser: req.user?._id,
+            text: text.trim(),
+            timestamp: timestamp ? new Date(timestamp) : new Date()
+        };
+
+        if (!meeting.transcript) meeting.transcript = [];
+        meeting.transcript.push(transcriptEntry);
         await meeting.save();
 
         res.status(200).json({
             success: true,
+            transcript: transcriptEntry,
+            transcriptCount: meeting.transcript.length,
+            meeting
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            message: err.message
+        });
+    }
+};
+
+exports.addMeetingChat = async (req, res) => {
+    try {
+        const { roomId } = req.params;
+        const { sender, text, timestamp } = req.body;
+
+        if (!text || !text.trim()) {
+            return res.status(400).json({
+                success: false,
+                message: "Message text cannot be empty"
+            });
+        }
+
+        const meeting = await findMeetingByRoomId(roomId);
+        if (!meeting) {
+            return res.status(404).json({
+                success: false,
+                message: "Meeting not found"
+            });
+        }
+
+        const chatEntry = {
+            sender: sender || req.user?.fullName || "Participant",
+            senderUser: req.user?._id,
+            text: text.trim(),
+            timestamp: timestamp ? new Date(timestamp) : new Date()
+        };
+
+        if (!meeting.chats) meeting.chats = [];
+        meeting.chats.push(chatEntry);
+        await meeting.save();
+
+        res.status(200).json({
+            success: true,
+            chat: chatEntry,
+            chatsCount: meeting.chats.length,
             meeting
         });
     } catch (err) {
@@ -228,12 +290,21 @@ exports.endMeeting = async (req, res) => {
         meeting.status = "completed";
         meeting.endTime = new Date();
 
-        // Process AI intelligence (transcripts/summary/action items)
-        const transcriptText = meeting.transcript
-            .map(t => `${t.sender}: ${t.text}`)
+        // Process AI intelligence (combine spoken voice transcripts, plus chats)
+        let conversationText = (meeting.transcript || [])
+            .map(t => `${t.sender} (Voice): ${t.text}`)
             .join("\n");
 
-        const aiResult = await aiService.generateSummaryAndActionItems(transcriptText, meeting.title);
+        if (meeting.chats && meeting.chats.length > 0) {
+            const chatLog = meeting.chats
+                .map(c => `${c.sender} (Chat): ${c.text}`)
+                .join("\n");
+            conversationText = conversationText 
+                ? `${conversationText}\n\n[Meeting Room Chats]:\n${chatLog}`
+                : `[Meeting Room Chats]:\n${chatLog}`;
+        }
+
+        const aiResult = await aiService.generateSummaryAndActionItems(conversationText, meeting.title);
         meeting.summary = aiResult.summary;
         meeting.actionItems = aiResult.actionItems.map(item => ({
             title: item.title,
@@ -255,3 +326,6 @@ exports.endMeeting = async (req, res) => {
         });
     }
 };
+
+exports.findMeetingByRoomId = findMeetingByRoomId;
+exports.normalizeRoomId = normalizeRoomId;

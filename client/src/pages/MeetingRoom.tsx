@@ -1,12 +1,12 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useStore } from "../store/store";
-import type { TranscriptItem } from "../store/store";
+import type { TranscriptItem, ChatItem } from "../store/store";
 import { socket } from "../services/socket";
 import { 
     Mic, MicOff, Video as VideoIcon, VideoOff, 
     Monitor, MessageSquare, ListTodo, Users, 
-    Send, LogOut, Bot, Copy, Volume2
+    Send, LogOut, Bot, Copy, Volume2, AudioWaveform
 } from "lucide-react";
 import toast from "react-hot-toast";
 
@@ -127,25 +127,28 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
 export default function MeetingRoom() {
     const { roomId } = useParams<{ roomId: string }>();
     const navigate = useNavigate();
-    const { user, activeMeeting, joinMeeting, endMeeting, addTranscriptMessage } = useStore();
+    const { user, activeMeeting, joinMeeting, endMeeting, addTranscriptMessage, addChatMessage } = useStore();
 
     // UI States
     const [inLobby, setInLobby] = useState(true);
     const [micEnabled, setMicEnabled] = useState(true);
     const [camEnabled, setCamEnabled] = useState(true);
     const [screenSharing, setScreenSharing] = useState(false);
-    const [activeTab, setActiveTab] = useState<"chat" | "notes" | "participants">("chat");
+    const [activeTab, setActiveTab] = useState<"chat" | "transcript" | "notes" | "participants">("chat");
 
-    // Chat and note states
-    const [messages, setMessages] = useState<TranscriptItem[]>([]);
+    // Chat and note states (text chats saved separately)
+    const [messages, setMessages] = useState<ChatItem[]>([]);
     const [chatInput, setChatInput] = useState("");
     const [meetingNotes, setMeetingNotes] = useState("");
     const [typingUser, setTypingUser] = useState("");
     const [typingTimeout, setTypingTimeout] = useState<any>(null);
 
-    // AI Transcription inputs
+    // Voice Transcripts (spoken speech-to-text saved separately)
+    const [transcripts, setTranscripts] = useState<TranscriptItem[]>([]);
     const [captionInput, setCaptionInput] = useState("");
     const [liveCaptionText, setLiveCaptionText] = useState("AI Voice Assistant: Listening to conversation...");
+    const [isTranscribing, setIsTranscribing] = useState(false);
+    const recognitionRef = useRef<any>(null);
 
     // Media stream references
     const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -247,11 +250,22 @@ export default function MeetingRoom() {
         }
     }, [localStream, inLobby, camEnabled]);
 
-    // 2. Fetch Meeting details on load
+    // 2. Fetch Meeting details on load (pre-populates chats and voice transcripts)
     useEffect(() => {
         if (roomId) {
             const cleanId = normalizeRoomId(roomId);
-            joinMeeting(cleanId).catch((err: any) => {
+            joinMeeting(cleanId).then((m) => {
+                if (m) {
+                    if (m.chats && m.chats.length > 0) {
+                        setMessages(m.chats);
+                    }
+                    if (m.transcript && m.transcript.length > 0) {
+                        setTranscripts(m.transcript);
+                        const last = m.transcript[m.transcript.length - 1];
+                        setLiveCaptionText(`${last.sender}: ${last.text}`);
+                    }
+                }
+            }).catch((err: any) => {
                 console.error("Meeting join failed:", err);
                 toast.error(err.message || "Meeting room not found");
                 navigate("/dashboard");
@@ -490,9 +504,13 @@ export default function MeetingRoom() {
             toast.success(`${name || "A participant"} left the call`);
         });
 
-        socket.on("receive-message", (msg: TranscriptItem) => {
+        socket.on("receive-message", (msg: ChatItem) => {
             setMessages((prev) => [...prev, msg]);
-            setLiveCaptionText(`${msg.sender}: ${msg.text}`);
+        });
+
+        socket.on("receive-transcript", (transcript: TranscriptItem) => {
+            setTranscripts((prev) => [...prev, transcript]);
+            setLiveCaptionText(`${transcript.sender}: ${transcript.text}`);
         });
 
         socket.on("user-typing", ({ userName, isTyping }) => {
@@ -518,16 +536,112 @@ export default function MeetingRoom() {
             socket.off("ice-candidate");
             socket.off("user-disconnected");
             socket.off("receive-message");
+            socket.off("receive-transcript");
             socket.off("user-typing");
             socket.disconnect();
 
             peersRef.current.forEach((pc) => pc.close());
             peersRef.current.clear();
             iceCandidatesQueue.current.clear();
+            stopSpeechRecognition();
         };
     }, []);
 
-    // 4. Simulate other participants talking if alone
+    // 4. Continuous Web Speech Recognition engine
+    const startSpeechRecognition = () => {
+        const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+            console.log("Web Speech API not supported in this browser. Fallback to manual transcription active.");
+            return;
+        }
+
+        try {
+            if (recognitionRef.current) {
+                try { recognitionRef.current.abort(); } catch (e) {}
+            }
+
+            const recognition = new SpeechRecognition();
+            recognition.continuous = true;
+            recognition.interimResults = false;
+            recognition.lang = "en-US";
+
+            recognition.onresult = (event: any) => {
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        const spokenText = event.results[i][0].transcript.trim();
+                        if (spokenText && roomId && user) {
+                            const item: TranscriptItem = {
+                                sender: user.fullName || "Speaker",
+                                text: spokenText,
+                                timestamp: new Date().toISOString()
+                            };
+
+                            // Broadcast live voice transcript to all peers in room
+                            socket.emit("voice-transcript", {
+                                roomId: normalizeRoomId(roomId),
+                                transcript: item
+                            });
+
+                            // Persist to MongoDB under user's name
+                            addTranscriptMessage(roomId, user.fullName || "Speaker", spokenText);
+
+                            setTranscripts((prev) => [...prev, item]);
+                            setLiveCaptionText(`${user.fullName || "Speaker"}: ${spokenText}`);
+                        }
+                    }
+                }
+            };
+
+            recognition.onerror = (event: any) => {
+                if (event.error !== "no-speech") {
+                    console.warn("Speech recognition notice:", event.error);
+                }
+            };
+
+            recognition.onend = () => {
+                if (!inLobby && micEnabled && recognitionRef.current) {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        // ignore restart collision
+                    }
+                } else {
+                    setIsTranscribing(false);
+                }
+            };
+
+            recognition.start();
+            recognitionRef.current = recognition;
+            setIsTranscribing(true);
+        } catch (err) {
+            console.warn("Speech recognition error:", err);
+            setIsTranscribing(false);
+        }
+    };
+
+    const stopSpeechRecognition = () => {
+        if (recognitionRef.current) {
+            try {
+                recognitionRef.current.abort();
+            } catch (e) {}
+            recognitionRef.current = null;
+        }
+        setIsTranscribing(false);
+    };
+
+    // Auto-activate or stop speech recognition based on microphone status
+    useEffect(() => {
+        if (!inLobby && micEnabled) {
+            startSpeechRecognition();
+        } else {
+            stopSpeechRecognition();
+        }
+        return () => {
+            stopSpeechRecognition();
+        };
+    }, [inLobby, micEnabled]);
+
+    // 5. Simulate other participants talking if alone
     const simulateTeammateTalk = () => {
         if (peers.length === 0) {
             const simulatedTalks = [
@@ -538,8 +652,8 @@ export default function MeetingRoom() {
 
             simulatedTalks.forEach((talk, idx) => {
                 setTimeout(() => {
-                    const msg = { sender: talk.sender, text: talk.text, timestamp: new Date().toISOString() };
-                    setMessages((prev) => [...prev, msg]);
+                    const item: TranscriptItem = { sender: talk.sender, text: talk.text, timestamp: new Date().toISOString() };
+                    setTranscripts((prev) => [...prev, item]);
                     setLiveCaptionText(`${talk.sender}: ${talk.text}`);
                     if (roomId) {
                         addTranscriptMessage(roomId, talk.sender, talk.text);
@@ -664,38 +778,45 @@ export default function MeetingRoom() {
         e.preventDefault();
         if (!chatInput.trim() || !roomId || !user) return;
 
-        const messageData = {
+        const messageData: ChatItem = {
             sender: user.fullName,
             text: chatInput.trim(),
             timestamp: new Date().toISOString()
         };
 
-        socket.emit("send-message", { roomId, message: messageData });
-        addTranscriptMessage(roomId, user.fullName, chatInput.trim());
+        socket.emit("send-message", { roomId: normalizeRoomId(roomId), message: messageData });
+        addChatMessage(roomId, user.fullName, chatInput.trim());
 
-        socket.emit("typing", { roomId, userName: user.fullName, isTyping: false });
+        setMessages((prev) => [...prev, messageData]);
+
+        socket.emit("typing", { roomId: normalizeRoomId(roomId), userName: user.fullName, isTyping: false });
         if (typingTimeout) clearTimeout(typingTimeout);
 
         setChatInput("");
     };
 
-    // 7. Live Custom Speech/Caption submit
+    // 7. Live Voice Transcription submit (manual dictation fallback)
     const handleAddLiveSpeech = (e: React.FormEvent) => {
         e.preventDefault();
         if (!captionInput.trim() || !roomId || !user) return;
 
-        addTranscriptMessage(roomId, user.fullName, captionInput.trim());
-
-        const msg = {
+        const transcriptItem: TranscriptItem = {
             sender: user.fullName,
             text: captionInput.trim(),
             timestamp: new Date().toISOString()
         };
-        socket.emit("send-message", { roomId, message: msg });
 
+        socket.emit("voice-transcript", {
+            roomId: normalizeRoomId(roomId),
+            transcript: transcriptItem
+        });
+
+        addTranscriptMessage(roomId, user.fullName, captionInput.trim());
+
+        setTranscripts((prev) => [...prev, transcriptItem]);
         setLiveCaptionText(`${user.fullName}: ${captionInput.trim()}`);
         setCaptionInput("");
-        toast.success("AI Transcribed Speech", { icon: "🎙️" });
+        toast.success("Voice transcript saved under your name", { icon: "🎙️" });
     };
 
     // 8. End or Leave Meeting
@@ -956,38 +1077,113 @@ export default function MeetingRoom() {
                     <div className="flex border-b border-white/5">
                         <button
                             onClick={() => setActiveTab("chat")}
-                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 cursor-pointer ${
+                            className={`flex-1 py-3 text-[11px] font-semibold flex items-center justify-center gap-1 border-b-2 cursor-pointer ${
                                 activeTab === "chat" 
                                     ? "border-violet-600 text-violet-400 bg-white/5" 
                                     : "border-transparent text-neutral-400 hover:text-white"
                             }`}
                         >
-                            <MessageSquare className="w-3.5 h-3.5" /> Room Chat
+                            <MessageSquare className="w-3.5 h-3.5" /> Chat ({messages.length})
+                        </button>
+                        <button
+                            onClick={() => setActiveTab("transcript")}
+                            className={`flex-1 py-3 text-[11px] font-semibold flex items-center justify-center gap-1 border-b-2 cursor-pointer ${
+                                activeTab === "transcript" 
+                                    ? "border-violet-600 text-violet-400 bg-white/5" 
+                                    : "border-transparent text-neutral-400 hover:text-white"
+                            }`}
+                        >
+                            <AudioWaveform className="w-3.5 h-3.5" /> Voice ({transcripts.length})
                         </button>
                         <button
                             onClick={() => setActiveTab("notes")}
-                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 cursor-pointer ${
+                            className={`flex-1 py-3 text-[11px] font-semibold flex items-center justify-center gap-1 border-b-2 cursor-pointer ${
                                 activeTab === "notes" 
                                     ? "border-violet-600 text-violet-400 bg-white/5" 
                                     : "border-transparent text-neutral-400 hover:text-white"
                             }`}
                         >
-                            <ListTodo className="w-3.5 h-3.5" /> Meeting Notes
+                            <ListTodo className="w-3.5 h-3.5" /> Notes
                         </button>
                         <button
                             onClick={() => setActiveTab("participants")}
-                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 cursor-pointer ${
+                            className={`flex-1 py-3 text-[11px] font-semibold flex items-center justify-center gap-1 border-b-2 cursor-pointer ${
                                 activeTab === "participants" 
                                     ? "border-violet-600 text-violet-400 bg-white/5" 
                                     : "border-transparent text-neutral-400 hover:text-white"
                             }`}
                         >
-                            <Users className="w-3.5 h-3.5" /> Members ({peers.length + 1})
+                            <Users className="w-3.5 h-3.5" /> ({peers.length + 1})
                         </button>
                     </div>
 
                     {/* Tab Contents */}
                     <div className="flex-1 flex flex-col min-h-0">
+                        {activeTab === "transcript" && (
+                            <div className="flex-1 flex flex-col min-h-0 p-4 justify-between">
+                                {/* Status Header */}
+                                <div className="flex items-center justify-between pb-3 mb-2 border-b border-white/5">
+                                    <span className="text-[10px] font-bold uppercase tracking-wider text-violet-400 flex items-center gap-1.5">
+                                        <span className={`w-2 h-2 rounded-full ${isTranscribing && micEnabled ? "bg-emerald-400 animate-pulse" : "bg-neutral-500"}`}></span>
+                                        {isTranscribing && micEnabled ? "Live Voice-to-Text Active" : (micEnabled ? "Mic on / Ready" : "Mic Muted (Paused)")}
+                                    </span>
+                                    <span className="text-[10px] text-neutral-400 font-mono">
+                                        {transcripts.length} entries
+                                    </span>
+                                </div>
+
+                                {/* Transcripts list */}
+                                <div className="flex-1 overflow-y-auto space-y-3 mb-3 pr-1">
+                                    {transcripts.length === 0 ? (
+                                        <div className="text-center py-10 text-neutral-500 text-xs space-y-2">
+                                            <AudioWaveform className="w-8 h-8 text-neutral-600 mx-auto opacity-50" />
+                                            <p className="font-semibold text-neutral-400">No voice transcripts yet</p>
+                                            <p className="text-[11px] text-neutral-500 max-w-[220px] mx-auto">
+                                                Speak into your microphone. Words are transcribed into text and saved under your username.
+                                            </p>
+                                        </div>
+                                    ) : (
+                                        transcripts.map((item, index) => (
+                                            <div 
+                                                key={index} 
+                                                className={`p-3 rounded-2xl max-w-[90%] text-xs border ${
+                                                    item.sender === user?.fullName 
+                                                        ? "ml-auto bg-emerald-500/10 border-emerald-500/20 text-emerald-200" 
+                                                        : "bg-white/5 border-white/5 text-neutral-300"
+                                                }`}
+                                            >
+                                                <div className="flex items-center justify-between gap-4 mb-1 text-[9px] font-bold opacity-60">
+                                                    <span className="flex items-center gap-1 text-violet-300">
+                                                        <Mic className="w-2.5 h-2.5" />
+                                                        {item.sender}
+                                                    </span>
+                                                    <span>{new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                                </div>
+                                                <p className="leading-relaxed break-words">{item.text}</p>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
+
+                                {/* Manual dictation fallback */}
+                                <form onSubmit={handleAddLiveSpeech} className="flex gap-2">
+                                    <input
+                                        type="text"
+                                        placeholder="Type speech note under your name..."
+                                        value={captionInput}
+                                        onChange={(e) => setCaptionInput(e.target.value)}
+                                        className="flex-1 text-xs px-3 py-2 rounded-xl glass-input"
+                                    />
+                                    <button 
+                                        type="submit" 
+                                        className="w-10 h-10 rounded-xl bg-violet-600 hover:bg-violet-500 flex items-center justify-center shrink-0 shadow shadow-violet-500/20 cursor-pointer"
+                                        title="Save to voice transcript"
+                                    >
+                                        <Send className="w-4 h-4 text-white" />
+                                    </button>
+                                </form>
+                            </div>
+                        )}
                         {activeTab === "chat" && (
                             <div className="flex-1 flex flex-col min-h-0 p-4 justify-between">
                                 {/* Message area */}

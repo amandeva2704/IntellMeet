@@ -4,6 +4,7 @@ const http = require("http");
 const { Server } = require("socket.io");
 const app = require("./app");
 const connectDB = require("./config/db");
+const { findMeetingByRoomId } = require("./controllers/meetingControllers");
 
 const PORT = process.env.PORT || 5000;
 
@@ -101,13 +102,49 @@ const startServer = async () => {
                 });
             });
 
-            // 3. Real-Time Chat inside room
-            socket.on("send-message", ({ roomId, message }) => {
+            // 3. Real-Time Chat inside room (persists separately to meeting.chats)
+            socket.on("send-message", async ({ roomId, message }) => {
                 const cleanRoomId = normalizeRoomId(roomId);
                 io.to(cleanRoomId).emit("receive-message", message);
+
+                try {
+                    const meeting = await findMeetingByRoomId(cleanRoomId);
+                    if (meeting && message && message.text) {
+                        if (!meeting.chats) meeting.chats = [];
+                        meeting.chats.push({
+                            sender: message.sender || "Participant",
+                            text: message.text,
+                            timestamp: message.timestamp ? new Date(message.timestamp) : new Date()
+                        });
+                        await meeting.save();
+                    }
+                } catch (saveErr) {
+                    console.warn("Could not persist chat message:", saveErr.message);
+                }
             });
 
-            // 4. Typing indicators
+            // 4. Real-Time Voice Transcription (persists separately to meeting.transcript under speaker's name)
+            socket.on("voice-transcript", async ({ roomId, transcript }) => {
+                const cleanRoomId = normalizeRoomId(roomId);
+                io.to(cleanRoomId).emit("receive-transcript", transcript);
+
+                try {
+                    const meeting = await findMeetingByRoomId(cleanRoomId);
+                    if (meeting && transcript && transcript.text) {
+                        if (!meeting.transcript) meeting.transcript = [];
+                        meeting.transcript.push({
+                            sender: transcript.sender || "Speaker",
+                            text: transcript.text,
+                            timestamp: transcript.timestamp ? new Date(transcript.timestamp) : new Date()
+                        });
+                        await meeting.save();
+                    }
+                } catch (saveErr) {
+                    console.warn("Could not persist voice transcript:", saveErr.message);
+                }
+            });
+
+            // 5. Typing indicators
             socket.on("typing", ({ roomId, userName, isTyping }) => {
                 const cleanRoomId = normalizeRoomId(roomId);
                 socket.to(cleanRoomId).emit("user-typing", { userName, isTyping });

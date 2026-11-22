@@ -33,6 +33,14 @@ export interface TranscriptItem {
     timestamp: string;
 }
 
+export interface ChatItem {
+    _id?: string;
+    sender: string;
+    senderUser?: any;
+    text: string;
+    timestamp: string;
+}
+
 export interface ActionItem {
     _id: string;
     title: string;
@@ -50,6 +58,7 @@ export interface Meeting {
     startTime: string;
     endTime?: string;
     transcript: TranscriptItem[];
+    chats?: ChatItem[];
     summary?: string;
     actionItems: ActionItem[];
     createdAt: string;
@@ -101,6 +110,7 @@ interface AppState {
     updateMeetingDetails: (meeting: Meeting) => void;
     endMeeting: (roomId: string) => Promise<Meeting>;
     addTranscriptMessage: (roomId: string, sender: string, text: string) => Promise<void>;
+    addChatMessage: (roomId: string, sender: string, text: string) => Promise<void>;
 
     // Tasks Slices
     tasks: Task[];
@@ -317,10 +327,22 @@ export const useStore = create<AppState>((set, get) => ({
     addTranscriptMessage: async (roomId, sender, text) => {
         try {
             const res = await api.put(`/meetings/${roomId}/transcript`, { sender, text });
-            const meeting = res.data.meeting;
-            set({ activeMeeting: meeting });
+            if (res.data?.meeting) {
+                set({ activeMeeting: res.data.meeting });
+            }
         } catch (err) {
             console.error("Failed to post transcript message", err);
+        }
+    },
+
+    addChatMessage: async (roomId, sender, text) => {
+        try {
+            const res = await api.post(`/meetings/${roomId}/chat`, { sender, text });
+            if (res.data?.meeting) {
+                set({ activeMeeting: res.data.meeting });
+            }
+        } catch (err) {
+            console.error("Failed to post chat message", err);
         }
     },
 

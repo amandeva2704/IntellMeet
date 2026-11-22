@@ -3,7 +3,8 @@ import { useParams, useNavigate, Link } from "react-router-dom";
 import { useStore } from "../store/store";
 import { 
     ArrowLeft, Bot, Calendar, FileText, CheckCircle2, 
-    CheckSquare, ListPlus, Loader2, Sparkles, Printer
+    CheckSquare, ListPlus, Loader2, Sparkles, Printer,
+    Mic, MessageSquare
 } from "lucide-react";
 import toast from "react-hot-toast";
 
@@ -18,6 +19,7 @@ export default function MeetingSummary() {
 
     const [selectedActionItems, setSelectedActionItems] = useState<string[]>([]); // Action item titles/ids
     const [isLoading, setIsLoading] = useState(false);
+    const [summaryLogTab, setSummaryLogTab] = useState<"transcript" | "chats">("transcript");
 
     useEffect(() => {
         if (roomId) {
@@ -280,29 +282,92 @@ export default function MeetingSummary() {
                     )}
                 </div>
 
-                {/* Transcripts history dialog block */}
-                <div className="glass-panel rounded-3xl p-6 md:p-8 border border-white/10">
-                    <h2 className="text-base font-bold flex items-center gap-2 mb-4">
-                        <FileText className="w-4 h-4 text-neutral-400" /> Full Meeting Conversation Transcript
-                    </h2>
+                {/* Transcripts & Chat history blocks (Saved separately with usernames) */}
+                <div className="glass-panel rounded-3xl p-6 md:p-8 border border-white/10 space-y-6">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-white/5">
+                        <div className="flex items-center gap-2">
+                            <h2 className="text-base font-bold text-white flex items-center gap-2">
+                                <FileText className="w-4 h-4 text-violet-400" /> Meeting Communications Log
+                            </h2>
+                            <span className="text-[11px] text-neutral-400">
+                                (Stored separately under respective usernames)
+                            </span>
+                        </div>
 
-                    <div className="space-y-3.5 max-h-72 overflow-y-auto pr-2">
-                        {activeMeeting.transcript.length === 0 ? (
-                            <div className="text-center py-6 text-neutral-500 text-xs italic">
-                                No speaking audio/text messages were sent in this session.
-                            </div>
-                        ) : (
-                            activeMeeting.transcript.map((line, idx) => (
-                                <div key={idx} className="text-xs bg-white/5 border border-white/5 p-3 rounded-2xl flex flex-col gap-1">
-                                    <div className="flex items-center justify-between text-[9px] font-bold text-neutral-400">
-                                        <span className="text-violet-400">{line.sender}</span>
-                                        <span>{new Date(line.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                                    </div>
-                                    <p className="text-neutral-200 leading-relaxed">{line.text}</p>
-                                </div>
-                            ))
-                        )}
+                        {/* Switcher */}
+                        <div className="flex bg-white/5 p-1 rounded-xl border border-white/5 print:hidden">
+                            <button
+                                onClick={() => setSummaryLogTab("transcript")}
+                                className={`px-4 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                                    summaryLogTab === "transcript"
+                                        ? "bg-violet-600 text-white shadow"
+                                        : "text-neutral-400 hover:text-white"
+                                }`}
+                            >
+                                <Mic className="w-3.5 h-3.5" />
+                                Voice Transcripts ({activeMeeting.transcript?.length || 0})
+                            </button>
+                            <button
+                                onClick={() => setSummaryLogTab("chats")}
+                                className={`px-4 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+                                    summaryLogTab === "chats"
+                                        ? "bg-violet-600 text-white shadow"
+                                        : "text-neutral-400 hover:text-white"
+                                }`}
+                            >
+                                <MessageSquare className="w-3.5 h-3.5" />
+                                Room Chats ({activeMeeting.chats?.length || 0})
+                            </button>
+                        </div>
                     </div>
+
+                    {/* Voice Transcripts View */}
+                    {summaryLogTab === "transcript" && (
+                        <div className="space-y-3.5 max-h-80 overflow-y-auto pr-2">
+                            {(!activeMeeting.transcript || activeMeeting.transcript.length === 0) ? (
+                                <div className="text-center py-8 text-neutral-500 text-xs italic">
+                                    No spoken voice conversations were transcribed in this session.
+                                </div>
+                            ) : (
+                                activeMeeting.transcript.map((line, idx) => (
+                                    <div key={idx} className="text-xs bg-white/5 border border-white/5 p-3.5 rounded-2xl flex flex-col gap-1.5">
+                                        <div className="flex items-center justify-between text-[10px] font-bold text-neutral-400">
+                                            <span className="text-violet-400 flex items-center gap-1.5 font-semibold">
+                                                <Mic className="w-3 h-3 text-emerald-400" />
+                                                {line.sender}
+                                            </span>
+                                            <span>{new Date(line.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                        </div>
+                                        <p className="text-neutral-200 leading-relaxed font-mono text-[11px]">{line.text}</p>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    )}
+
+                    {/* Room Chats View */}
+                    {summaryLogTab === "chats" && (
+                        <div className="space-y-3.5 max-h-80 overflow-y-auto pr-2">
+                            {(!activeMeeting.chats || activeMeeting.chats.length === 0) ? (
+                                <div className="text-center py-8 text-neutral-500 text-xs italic">
+                                    No in-meeting chat messages were sent in this session.
+                                </div>
+                            ) : (
+                                activeMeeting.chats.map((chat, idx) => (
+                                    <div key={idx} className="text-xs bg-white/5 border border-white/5 p-3.5 rounded-2xl flex flex-col gap-1.5">
+                                        <div className="flex items-center justify-between text-[10px] font-bold text-neutral-400">
+                                            <span className="text-violet-300 flex items-center gap-1.5 font-semibold">
+                                                <MessageSquare className="w-3 h-3 text-violet-400" />
+                                                {chat.sender}
+                                            </span>
+                                            <span>{new Date(chat.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                        </div>
+                                        <p className="text-neutral-200 leading-relaxed">{chat.text}</p>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+                    )}
                 </div>
             </div>
         </div>

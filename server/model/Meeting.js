@@ -49,6 +49,30 @@ const meetingSchema = new mongoose.Schema(
                 type: String,
                 required: true
             },
+            senderUser: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "User"
+            },
+            text: {
+                type: String,
+                required: true
+            },
+            timestamp: {
+                type: Date,
+                default: Date.now
+            }
+        }
+    ],
+    chats: [
+        {
+            sender: {
+                type: String,
+                required: true
+            },
+            senderUser: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "User"
+            },
             text: {
                 type: String,
                 required: true
