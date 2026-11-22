@@ -35,8 +35,9 @@ export default function RegisterPage() {
 
         try {
             await register(formData);
-            toast.success("Account registered successfully! Please log in.");
-            navigate(loginTarget);
+            toast.success("Account created and signed in successfully!");
+            const target = redirectParam ? decodeURIComponent(redirectParam) : "/dashboard";
+            navigate(target);
         } catch (error: any) {
             toast.error(error.message || "Failed to register account");
         }
@@ -136,7 +137,7 @@ export default function RegisterPage() {
 
                 <div className="mt-8 text-center text-sm text-neutral-400">
                     Already have an account?{" "}
-                    <Link to="/login" className="text-violet-400 hover:text-violet-300 font-semibold hover:underline">
+                    <Link to={loginTarget} className="text-violet-400 hover:text-violet-300 font-semibold hover:underline">
                         Sign In
                     </Link>
                 </div>

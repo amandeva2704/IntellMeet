@@ -16,13 +16,13 @@ import Analytics from "./pages/Analytics";
 
 // Protected Route Guard
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-    const { isAuthenticated, fetchProfile, token } = useStore();
+    const { isAuthenticated, fetchProfile, token, user } = useStore();
     const [checking, setChecking] = useState(true);
     const location = useLocation();
 
     useEffect(() => {
         const verifyUser = async () => {
-            if (token && !isAuthenticated) {
+            if (token && !user) {
                 try {
                     await fetchProfile();
                 } catch (e) {
@@ -32,7 +32,7 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
             setChecking(false);
         };
         verifyUser();
-    }, [token, isAuthenticated, fetchProfile]);
+    }, [token, user, fetchProfile]);
 
     if (checking) {
         return (

@@ -147,6 +147,10 @@ export const useStore = create<AppState>((set, get) => ({
         set({ authLoading: true });
         try {
             const res = await api.post("/auth/register", details);
+            const { user, token } = res.data;
+            if (user && token) {
+                get().setAuth(user, token);
+            }
             set({ authLoading: false });
             return res.data;
         } catch (err: any) {
