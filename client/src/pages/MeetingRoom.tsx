@@ -6,7 +6,7 @@ import { socket } from "../services/socket";
 import { 
     Mic, MicOff, Video as VideoIcon, VideoOff, 
     Monitor, MessageSquare, ListTodo, Users, 
-    Send, LogOut, Bot, Copy
+    Send, LogOut, Bot, Copy, Volume2
 } from "lucide-react";
 import toast from "react-hot-toast";
 
@@ -24,30 +24,69 @@ const normalizeRoomId = (input?: string): string => {
     return clean;
 };
 
+// Resilient STUN configuration for NAT traversal between mobile 4G/5G and Wi-Fi networks
 const ICE_SERVERS: RTCConfiguration = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" }
-    ]
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" },
+        { urls: "stun:stun.relay.metered.ca:80" },
+        { urls: "stun:global.stun.twilio.com:3478" }
+    ],
+    iceCandidatePoolSize: 10
 };
 
-// Sub-component to render remote peer video feed
+// Sub-component to render remote peer video and audio feeds
 function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any }; stream?: MediaStream }) {
     const videoRef = useRef<HTMLVideoElement>(null);
+    const audioRef = useRef<HTMLAudioElement>(null);
+    const [audioBlocked, setAudioBlocked] = useState(false);
+    const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
 
     useEffect(() => {
-        if (videoRef.current && stream) {
+        if (!stream) {
+            setHasRemoteVideo(false);
+            return;
+        }
+
+        const videoTracks = stream.getVideoTracks();
+        setHasRemoteVideo(videoTracks.length > 0 && videoTracks[0].enabled);
+
+        if (videoRef.current) {
             videoRef.current.srcObject = stream;
             videoRef.current.play().catch((err) => {
-                console.warn("Remote peer video autoplay prevented:", err);
+                console.warn("Peer video autoplay was prevented:", err);
+            });
+        }
+
+        if (audioRef.current) {
+            audioRef.current.srcObject = stream;
+            audioRef.current.play().then(() => {
+                setAudioBlocked(false);
+            }).catch((err) => {
+                console.warn("Peer audio autoplay was blocked by browser:", err);
+                setAudioBlocked(true);
             });
         }
     }, [stream]);
 
+    const handleEnableAudio = () => {
+        if (audioRef.current) {
+            audioRef.current.play().then(() => setAudioBlocked(false)).catch(console.error);
+        }
+        if (videoRef.current) {
+            videoRef.current.play().catch(console.error);
+        }
+    };
+
     return (
         <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center">
-            {stream ? (
+            {/* Dedicated HTML5 audio tag for clear speaker output */}
+            <audio ref={audioRef} autoPlay playsInline />
+
+            {stream && hasRemoteVideo ? (
                 <video 
                     ref={videoRef} 
                     autoPlay 
@@ -60,7 +99,21 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
                         {peer.user?.fullName?.charAt(0).toUpperCase() || "P"}
                     </div>
                     <span className="text-xs text-neutral-400 block">{peer.user?.fullName}</span>
+                    <span className="text-[10px] text-neutral-500 block">
+                        {stream ? "Audio only" : "Connecting..."}
+                    </span>
                 </div>
+            )}
+
+            {/* Click-to-play Audio Unlock for mobile browsers */}
+            {audioBlocked && (
+                <button
+                    type="button"
+                    onClick={handleEnableAudio}
+                    className="absolute top-3 right-3 bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-bold px-3 py-1.5 rounded-full flex items-center gap-1.5 shadow-xl z-20 animate-pulse cursor-pointer"
+                >
+                    <Volume2 className="w-3.5 h-3.5" /> Tap to Hear Audio
+                </button>
             )}
 
             <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
@@ -99,23 +152,29 @@ export default function MeetingRoom() {
     const localStreamRef = useRef<MediaStream | null>(null);
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
     
-    // WebRTC Peer connections & remote streams
+    // WebRTC Peer connections, Queued ICE Candidates & Remote Streams
     const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+    const iceCandidatesQueue = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
     const [peers, setPeers] = useState<{ socketId: string; user: any }[]>([]);
     const [remoteStreams, setRemoteStreams] = useState<{ [socketId: string]: MediaStream }>({});
 
-    // 1. Camera Initialization
+    // 1. Camera & Microphone Initialization
     const startCamera = async () => {
         try {
             let stream: MediaStream;
             try {
+                // Request video & audio with ideal mobile & desktop settings
                 stream = await navigator.mediaDevices.getUserMedia({
                     video: {
                         facingMode: "user",
                         width: { ideal: 1280 },
                         height: { ideal: 720 }
                     },
-                    audio: true
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
                 });
             } catch (bothErr) {
                 console.warn("Could not access video+audio together, trying video only:", bothErr);
@@ -200,6 +259,22 @@ export default function MeetingRoom() {
         }
     }, [roomId]);
 
+    // Helper: Drain queued ICE candidates once remoteDescription is set
+    const drainQueuedCandidates = async (peerSocketId: string, pc: RTCPeerConnection) => {
+        const queued = iceCandidatesQueue.current.get(peerSocketId) || [];
+        if (queued.length > 0) {
+            console.log(`🧊 Applying ${queued.length} queued ICE candidates for ${peerSocketId}`);
+            for (const cand of queued) {
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(cand));
+                } catch (err) {
+                    console.warn("Error applying queued ICE candidate:", err);
+                }
+            }
+            iceCandidatesQueue.current.delete(peerSocketId);
+        }
+    };
+
     // Helper: Create an RTCPeerConnection for a target peer
     const createPeerConnection = (targetSocketId: string) => {
         if (peersRef.current.has(targetSocketId)) {
@@ -209,33 +284,57 @@ export default function MeetingRoom() {
         const pc = new RTCPeerConnection(ICE_SERVERS);
         peersRef.current.set(targetSocketId, pc);
 
-        // Add local tracks if available
+        // Add local tracks (both video & audio) to peer connection
         if (localStreamRef.current) {
             localStreamRef.current.getTracks().forEach((track) => {
                 pc.addTrack(track, localStreamRef.current!);
             });
         }
 
-        // Send ICE candidate to peer
+        // Send gathered ICE candidate to peer
         pc.onicecandidate = (event) => {
             if (event.candidate) {
                 socket.emit("ice-candidate", {
                     target: targetSocketId,
-                    candidate: event.candidate
+                    candidate: event.candidate.toJSON()
                 });
             }
         };
 
-        // Receive remote track
+        // Receive remote track (combines both audio and video into unified MediaStream)
         pc.ontrack = (event) => {
-            const stream = event.streams[0] || new MediaStream([event.track]);
-            setRemoteStreams((prev) => ({
-                ...prev,
-                [targetSocketId]: stream
-            }));
+            console.log(`📡 Remote track received from ${targetSocketId}:`, event.track.kind);
+            setRemoteStreams((prev) => {
+                const existing = prev[targetSocketId];
+                if (existing) {
+                    if (!existing.getTracks().some((t) => t.id === event.track.id)) {
+                        existing.addTrack(event.track);
+                    }
+                    return {
+                        ...prev,
+                        [targetSocketId]: new MediaStream(existing.getTracks())
+                    };
+                } else {
+                    const newStream = event.streams && event.streams[0]
+                        ? new MediaStream(event.streams[0].getTracks())
+                        : new MediaStream([event.track]);
+                    return {
+                        ...prev,
+                        [targetSocketId]: newStream
+                    };
+                }
+            });
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            console.log(`🧊 ICE State with ${targetSocketId}:`, pc.iceConnectionState);
+            if (pc.iceConnectionState === "failed") {
+                pc.restartIce();
+            }
         };
 
         pc.onconnectionstatechange = () => {
+            console.log(`🔌 Connection state with ${targetSocketId}:`, pc.connectionState);
             if (
                 pc.connectionState === "disconnected" ||
                 pc.connectionState === "failed" ||
@@ -253,31 +352,49 @@ export default function MeetingRoom() {
     };
 
     // 3. Connect Sockets and WebRTC signalling on joining
-    const handleJoinRoom = () => {
-        if (!roomId || !user) return;
+    const handleJoinRoom = async () => {
+        if (!roomId) return;
+        const cleanRoomId = normalizeRoomId(roomId);
         setInLobby(false);
 
-        // Connect socket
-        socket.connect();
+        // Ensure camera & mic stream is acquired BEFORE creating peer connections
+        let currentStream = localStreamRef.current;
+        if (!currentStream) {
+            currentStream = await startCamera();
+        }
+
+        const safeUser = user || {
+            _id: "user_" + Date.now(),
+            fullName: "Participant"
+        };
+
+        // Connect socket if not already connected
+        if (!socket.connected) {
+            socket.connect();
+        }
         
-        // Emit join-room
-        socket.emit("join-room", { roomId, user });
+        // Emit join-room with normalized roomId
+        socket.emit("join-room", { roomId: cleanRoomId, user: safeUser });
 
         // Listeners
         socket.on("all-users", async (usersList: { socketId: string; user: any }[]) => {
+            console.log("👥 Existing users in room:", usersList);
             setPeers(usersList);
-            toast.success("Successfully connected to meeting server");
+            toast.success("Connected to meeting room");
 
             // Initiate WebRTC peer connections with everyone currently in the room
             for (const peer of usersList) {
                 try {
                     const pc = createPeerConnection(peer.socketId);
-                    const offer = await pc.createOffer();
+                    const offer = await pc.createOffer({
+                        offerToReceiveAudio: true,
+                        offerToReceiveVideo: true
+                    });
                     await pc.setLocalDescription(offer);
                     socket.emit("sending-signal", {
                         userToSignal: peer.socketId,
                         callerId: socket.id,
-                        callerUser: user,
+                        callerUser: safeUser,
                         signal: offer
                     });
                 } catch (err) {
@@ -287,15 +404,17 @@ export default function MeetingRoom() {
         });
 
         socket.on("user-connected", ({ socketId, user: joiningUser }) => {
+            console.log("👤 New user joined room:", joiningUser?.fullName, socketId);
             setPeers((prev) => {
                 if (prev.some((p) => p.socketId === socketId)) return prev;
                 return [...prev, { socketId, user: joiningUser }];
             });
-            toast.success(`${joiningUser.fullName} joined the call`);
+            toast.success(`${joiningUser?.fullName || "A peer"} joined the call`);
         });
 
         // Receiving an offer from a newcomer
         socket.on("user-joined-signal", async ({ callerId, callerUser, signal }) => {
+            console.log("📥 Received WebRTC offer from:", callerId, callerUser?.fullName);
             try {
                 setPeers((prev) => {
                     if (prev.some((p) => p.socketId === callerId)) return prev;
@@ -304,6 +423,10 @@ export default function MeetingRoom() {
 
                 const pc = createPeerConnection(callerId);
                 await pc.setRemoteDescription(new RTCSessionDescription(signal));
+
+                // Drain any early ICE candidates received while waiting for offer
+                await drainQueuedCandidates(callerId, pc);
+
                 const answer = await pc.createAnswer();
                 await pc.setLocalDescription(answer);
 
@@ -318,34 +441,46 @@ export default function MeetingRoom() {
 
         // Receiving an answer back from the target peer
         socket.on("receiving-returned-signal", async ({ id, signal }) => {
+            console.log("📥 Received WebRTC answer from:", id);
             try {
                 const pc = peersRef.current.get(id);
-                if (pc && pc.signalingState !== "stable") {
-                    await pc.setRemoteDescription(new RTCSessionDescription(signal));
+                if (pc) {
+                    if (pc.signalingState !== "stable") {
+                        await pc.setRemoteDescription(new RTCSessionDescription(signal));
+                    }
+                    // Drain any queued ICE candidates received while waiting for answer
+                    await drainQueuedCandidates(id, pc);
                 }
             } catch (err) {
                 console.error("Failed to set remote description from:", id, err);
             }
         });
 
-        // Handle incoming ICE candidate
+        // Handle incoming ICE candidate with queuing to prevent premature drops
         socket.on("ice-candidate", async ({ sender, candidate }) => {
-            try {
-                const pc = peersRef.current.get(sender);
-                if (pc && candidate) {
+            const pc = peersRef.current.get(sender);
+            if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+                try {
                     await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                } catch (err) {
+                    console.warn("Failed to add ICE candidate from:", sender, err);
                 }
-            } catch (err) {
-                console.warn("Failed to add ICE candidate from:", sender, err);
+            } else {
+                // Queue candidate until setRemoteDescription finishes
+                const queue = iceCandidatesQueue.current.get(sender) || [];
+                queue.push(candidate);
+                iceCandidatesQueue.current.set(sender, queue);
             }
         });
 
         socket.on("user-disconnected", ({ socketId, name }) => {
+            console.log("👋 User disconnected:", socketId, name);
             const pc = peersRef.current.get(socketId);
             if (pc) {
                 pc.close();
                 peersRef.current.delete(socketId);
             }
+            iceCandidatesQueue.current.delete(socketId);
             setRemoteStreams((prev) => {
                 const next = { ...prev };
                 delete next[socketId];
@@ -388,6 +523,7 @@ export default function MeetingRoom() {
 
             peersRef.current.forEach((pc) => pc.close());
             peersRef.current.clear();
+            iceCandidatesQueue.current.clear();
         };
     }, []);
 
@@ -422,8 +558,10 @@ export default function MeetingRoom() {
 
         const audioTrack = localStreamRef.current.getAudioTracks()[0];
         if (audioTrack) {
-            audioTrack.enabled = !micEnabled;
-            setMicEnabled(!micEnabled);
+            const nextState = !micEnabled;
+            audioTrack.enabled = nextState;
+            setMicEnabled(nextState);
+            toast.success(nextState ? "Microphone enabled" : "Microphone muted");
         } else {
             setMicEnabled(!micEnabled);
         }
@@ -447,6 +585,7 @@ export default function MeetingRoom() {
                 localVideoRef.current.srcObject = localStreamRef.current;
                 localVideoRef.current.play().catch(() => {});
             }
+            toast.success(nextState ? "Camera enabled" : "Camera turned off");
         } else {
             await startCamera();
         }
@@ -565,6 +704,7 @@ export default function MeetingRoom() {
         stopCamera();
         peersRef.current.forEach((pc) => pc.close());
         peersRef.current.clear();
+        iceCandidatesQueue.current.clear();
         toast.success("You left the meeting room");
         navigate("/dashboard");
     };
@@ -578,6 +718,7 @@ export default function MeetingRoom() {
             stopCamera();
             peersRef.current.forEach((pc) => pc.close());
             peersRef.current.clear();
+            iceCandidatesQueue.current.clear();
             await endMeeting(roomId);
             toast.success("Meeting ended! AI analysis ready.");
             navigate(`/meeting/${roomId}/summary`);
@@ -617,7 +758,7 @@ export default function MeetingRoom() {
                             {/* Camera overlay indicators */}
                             <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-[10px] text-neutral-300 font-semibold border border-white/5 flex items-center gap-1.5">
                                 <span className={`w-2 h-2 rounded-full ${camEnabled && localStream ? "bg-emerald-500" : "bg-red-500"}`}></span>
-                                {user?.fullName}
+                                {user?.fullName || "You"}
                             </div>
                         </div>
 
@@ -625,7 +766,7 @@ export default function MeetingRoom() {
                         <div className="flex items-center justify-center gap-3">
                             <button
                                 onClick={toggleMic}
-                                className={`w-12 h-12 rounded-xl border flex items-center justify-center transition-all ${
+                                className={`w-12 h-12 rounded-xl border flex items-center justify-center transition-all cursor-pointer ${
                                     micEnabled 
                                         ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
                                         : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
@@ -636,7 +777,7 @@ export default function MeetingRoom() {
                             </button>
                             <button
                                 onClick={toggleCam}
-                                className={`w-12 h-12 rounded-xl border flex items-center justify-center transition-all ${
+                                className={`w-12 h-12 rounded-xl border flex items-center justify-center transition-all cursor-pointer ${
                                     camEnabled 
                                         ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
                                         : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
@@ -765,7 +906,7 @@ export default function MeetingRoom() {
                             {/* User details */}
                             <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
                                 <span className={`w-1.5 h-1.5 rounded-full ${camEnabled && localStream ? "bg-emerald-500" : "bg-red-500"}`}></span>
-                                {user?.fullName} (You)
+                                {user?.fullName || "You"} (You)
                             </div>
                         </div>
 
@@ -783,13 +924,13 @@ export default function MeetingRoom() {
                             <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-gradient-to-br from-[#12131a] to-[#1c1d29] border border-violet-500/10 shadow-lg relative overflow-hidden flex flex-col items-center justify-center text-center p-6">
                                 <div className="absolute top-0 right-0 w-24 h-24 bg-violet-600/5 blur-2xl"></div>
                                 <Bot className="w-10 h-10 text-violet-400 mb-2 animate-bounce" />
-                                <h3 className="font-bold text-sm">AI Transcript Core</h3>
+                                <h3 className="font-bold text-sm">Waiting for teammates...</h3>
                                 <p className="text-xs text-neutral-400 max-w-xs mt-1.5 leading-relaxed">
-                                    Simulating active team listening. Type speech transcriptions in the bottom box to build the smart action summary timeline.
+                                    Share the invite link to invite peers. As soon as they enter the room, their camera and audio will stream live here.
                                 </p>
                                 <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>
-                                    AI Transcriber Active
+                                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse"></span>
+                                    WebRTC Room Ready
                                 </div>
                             </div>
                         )}
@@ -931,9 +1072,9 @@ export default function MeetingRoom() {
                                 <div className="flex items-center justify-between p-2.5 rounded-xl border border-white/5 bg-[#12131a]">
                                     <div className="flex items-center gap-2 text-xs">
                                         <div className="w-5 h-5 rounded-full bg-violet-600/20 text-violet-400 font-bold text-[10px] flex items-center justify-center">
-                                            {user?.fullName.charAt(0).toUpperCase()}
+                                            {user?.fullName?.charAt(0).toUpperCase() || "Y"}
                                         </div>
-                                        <span className="font-semibold text-white">{user?.fullName} (You)</span>
+                                        <span className="font-semibold text-white">{user?.fullName || "You"} (You)</span>
                                     </div>
                                     <span className="text-[10px] text-violet-400 font-bold bg-violet-500/10 px-2 py-0.5 rounded">Host</span>
                                 </div>

@@ -7,6 +7,16 @@ const connectDB = require("./config/db");
 
 const PORT = process.env.PORT || 5000;
 
+// Helper to normalize room IDs across all clients
+const normalizeRoomId = (id) => {
+    if (!id) return "";
+    let clean = String(id).trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (clean.length === 9) {
+        return `${clean.substring(0, 3)}-${clean.substring(3, 6)}-${clean.substring(6, 9)}`;
+    }
+    return clean;
+};
+
 // Track active users and their rooms
 // socketId -> { roomId, user }
 const activeConnections = new Map();
@@ -33,11 +43,13 @@ const startServer = async () => {
 
             // 1. Join room
             socket.on("join-room", ({ roomId, user }) => {
-                const cleanRoomId = roomId ? String(roomId).trim().toLowerCase().replace(/[^a-z0-9-]/g, "") : roomId;
-                socket.join(cleanRoomId);
-                activeConnections.set(socket.id, { roomId: cleanRoomId, user });
+                const cleanRoomId = normalizeRoomId(roomId);
+                const safeUser = user || { _id: socket.id, fullName: "Participant" };
 
-                console.log(`👤 User "${user.fullName}" (${user._id}) joined room: ${cleanRoomId}`);
+                socket.join(cleanRoomId);
+                activeConnections.set(socket.id, { roomId: cleanRoomId, user: safeUser });
+
+                console.log(`👤 User "${safeUser.fullName}" (${safeUser._id}) joined room: ${cleanRoomId}`);
 
                 // Fetch other sockets in this room to establish WebRTC connections
                 const clientsInRoom = io.sockets.adapter.rooms.get(cleanRoomId);
@@ -49,7 +61,7 @@ const startServer = async () => {
                             const clientData = activeConnections.get(clientId);
                             otherUserSockets.push({
                                 socketId: clientId,
-                                user: clientData ? clientData.user : null
+                                user: clientData ? clientData.user : { _id: clientId, fullName: "Peer" }
                             });
                         }
                     }
@@ -61,7 +73,7 @@ const startServer = async () => {
                 // Notify other users that a new user connected
                 socket.to(cleanRoomId).emit("user-connected", {
                     socketId: socket.id,
-                    user: user
+                    user: safeUser
                 });
             });
 
@@ -91,18 +103,18 @@ const startServer = async () => {
 
             // 3. Real-Time Chat inside room
             socket.on("send-message", ({ roomId, message }) => {
-                // message: { sender, text, timestamp }
-                io.to(roomId).emit("receive-message", message);
+                const cleanRoomId = normalizeRoomId(roomId);
+                io.to(cleanRoomId).emit("receive-message", message);
             });
 
             // 4. Typing indicators
             socket.on("typing", ({ roomId, userName, isTyping }) => {
-                socket.to(roomId).emit("user-typing", { userName, isTyping });
+                const cleanRoomId = normalizeRoomId(roomId);
+                socket.to(cleanRoomId).emit("user-typing", { userName, isTyping });
             });
 
             // 5. Kanban / Workspace Board Sync
             socket.on("kanban-task-change", ({ workspaceId }) => {
-                // Broadcast to everyone in the workspace room to refresh their tasks
                 socket.broadcast.emit("refresh-kanban-board", { workspaceId });
             });
 
@@ -112,11 +124,10 @@ const startServer = async () => {
                 const connectionData = activeConnections.get(socket.id);
                 if (connectionData) {
                     const { roomId, user } = connectionData;
-                    // Notify other users
                     socket.to(roomId).emit("user-disconnected", {
                         socketId: socket.id,
-                        userId: user._id,
-                        name: user.fullName
+                        userId: user?._id || socket.id,
+                        name: user?.fullName || "A participant"
                     });
                     activeConnections.delete(socket.id);
                 }
