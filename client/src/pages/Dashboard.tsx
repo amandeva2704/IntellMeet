@@ -80,13 +80,10 @@ export default function Dashboard() {
 
     const handleStartMeeting = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!meetingTitle.trim()) {
-            toast.error("Please enter a meeting title");
-            return;
-        }
+        const finalTitle = meetingTitle.trim() || `${user?.fullName || "Instant"}'s Meeting`;
         try {
             setIsLoadingMeeting(true);
-            const meeting = await createMeeting(meetingTitle);
+            const meeting = await createMeeting(finalTitle);
             toast.success("Meeting room created!");
             navigate(`/meeting/${meeting.roomId}`);
         } catch (err: any) {
@@ -142,7 +139,7 @@ export default function Dashboard() {
                 <div className="p-4 border-b border-white/5">
                     <div className="flex items-center gap-3">
                         <div className="w-10 h-10 rounded-full bg-violet-500/10 border border-violet-500/30 flex items-center justify-center font-bold text-violet-400 uppercase text-sm">
-                            {user?.fullName.charAt(0) || "U"}
+                            {user?.fullName?.charAt(0) || "U"}
                         </div>
                         <div className="overflow-hidden">
                             <h4 className="font-semibold text-sm truncate text-white">{user?.fullName || "User Profile"}</h4>
@@ -277,11 +274,10 @@ export default function Dashboard() {
                             <form onSubmit={handleStartMeeting} className="space-y-3">
                                 <input
                                     type="text"
-                                    placeholder="Meeting Subject (e.g. Sprint Checkin)"
+                                    placeholder="Meeting Subject (optional, e.g. Sprint Review)"
                                     value={meetingTitle}
                                     onChange={(e) => setMeetingTitle(e.target.value)}
                                     className="w-full text-xs px-3 py-2.5 rounded-xl glass-input"
-                                    required
                                 />
                                 <button
                                     type="submit"
@@ -374,7 +370,7 @@ export default function Dashboard() {
                                                 title={m.email}
                                             >
                                                 <div className="w-3.5 h-3.5 rounded-full bg-violet-600/20 text-violet-400 font-bold text-[9px] flex items-center justify-center">
-                                                    {m.fullName.charAt(0).toUpperCase()}
+                                                    {m.fullName?.charAt(0)?.toUpperCase() || "M"}
                                                 </div>
                                                 <span className="truncate max-w-[80px] text-neutral-300 font-medium">
                                                     {m.fullName}

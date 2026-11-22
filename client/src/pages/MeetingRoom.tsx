@@ -266,9 +266,12 @@ export default function MeetingRoom() {
                     }
                 }
             }).catch((err: any) => {
-                console.error("Meeting join failed:", err);
-                toast.error(err.message || "Meeting room not found");
-                navigate("/dashboard");
+                console.warn("Meeting join notice:", err);
+                const currentActive = useStore.getState().activeMeeting;
+                if (!currentActive || normalizeRoomId(currentActive.roomId) !== cleanId) {
+                    toast.error(err.message || "Meeting room not found");
+                    navigate("/dashboard");
+                }
             });
         }
     }, [roomId]);

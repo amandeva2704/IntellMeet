@@ -23,4 +23,21 @@ api.interceptors.request.use((config) => {
     return Promise.reject(error);
 });
 
+// Add a response interceptor to handle expired or invalid credentials
+api.interceptors.response.use(
+    (response) => response,
+    (error) => {
+        if (error.response && error.response.status === 401) {
+            const path = window.location.pathname;
+            // Only redirect if not already on public auth pages
+            if (path !== "/login" && path !== "/register" && path !== "/") {
+                localStorage.removeItem("token");
+                const redirect = encodeURIComponent(window.location.pathname + window.location.search);
+                window.location.href = `/login?redirect=${redirect}`;
+            }
+        }
+        return Promise.reject(error);
+    }
+);
+
 export default api;

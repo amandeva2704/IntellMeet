@@ -516,7 +516,7 @@ function CardComponent({ task, onMove, onSelect }: CardProps) {
                 {/* Assignee initials badge */}
                 <div className="flex items-center gap-1.5 text-neutral-400">
                     <div className="w-4 h-4 rounded-full bg-violet-600/10 text-violet-400 border border-violet-500/20 flex items-center justify-center font-bold text-[8px] uppercase">
-                        {task.assignee ? task.assignee.fullName.charAt(0) : "?"}
+                        {task.assignee ? task.assignee.fullName?.charAt(0) || "?" : "?"}
                     </div>
                     <span className="truncate max-w-[80px] font-medium text-[9px]">
                         {task.assignee ? task.assignee.fullName : "Unassigned"}

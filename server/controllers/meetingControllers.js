@@ -57,19 +57,16 @@ const findMeetingByRoomId = async (rawRoomId) => {
 exports.createMeeting = async (req, res) => {
     try {
         const { title } = req.body;
-        if (!title) {
-            return res.status(400).json({
-                success: false,
-                message: "Meeting title is required"
-            });
-        }
+        const finalTitle = (title && String(title).trim())
+            ? String(title).trim()
+            : `${req.user?.fullName || "Instant"}'s Meeting`;
 
         const roomId = generateRoomId();
         const meeting = await Meeting.create({
             roomId,
-            title,
+            title: finalTitle,
             host: req.user._id,
-            participants: [{ user: req.user._id, name: req.user.fullName }]
+            participants: [{ user: req.user._id, name: req.user?.fullName || "Host" }]
         });
 
         res.status(201).json({
