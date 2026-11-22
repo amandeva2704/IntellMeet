@@ -80,6 +80,14 @@ const startServer = async () => {
                 });
             });
 
+            // WebRTC ICE Candidate Relay
+            socket.on("ice-candidate", ({ target, candidate }) => {
+                io.to(target).emit("ice-candidate", {
+                    sender: socket.id,
+                    candidate
+                });
+            });
+
             // 3. Real-Time Chat inside room
             socket.on("send-message", ({ roomId, message }) => {
                 // message: { sender, text, timestamp }

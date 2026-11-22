@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useStore } from "../store/store";
 import type { TranscriptItem } from "../store/store";
@@ -9,6 +9,53 @@ import {
     Send, LogOut, Bot
 } from "lucide-react";
 import toast from "react-hot-toast";
+
+const ICE_SERVERS: RTCConfiguration = {
+    iceServers: [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" }
+    ]
+};
+
+// Sub-component to render remote peer video feed
+function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any }; stream?: MediaStream }) {
+    const videoRef = useRef<HTMLVideoElement>(null);
+
+    useEffect(() => {
+        if (videoRef.current && stream) {
+            videoRef.current.srcObject = stream;
+            videoRef.current.play().catch((err) => {
+                console.warn("Remote peer video autoplay prevented:", err);
+            });
+        }
+    }, [stream]);
+
+    return (
+        <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center">
+            {stream ? (
+                <video 
+                    ref={videoRef} 
+                    autoPlay 
+                    playsInline 
+                    className="w-full h-full object-cover"
+                />
+            ) : (
+                <div className="text-center space-y-2">
+                    <div className="w-16 h-16 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-400 font-extrabold text-lg flex items-center justify-center mx-auto">
+                        {peer.user?.fullName?.charAt(0).toUpperCase() || "P"}
+                    </div>
+                    <span className="text-xs text-neutral-400 block">{peer.user?.fullName}</span>
+                </div>
+            )}
+
+            <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
+                <span className={`w-1.5 h-1.5 rounded-full ${stream ? "bg-emerald-400" : "bg-amber-400"}`}></span>
+                {peer.user?.fullName || "Peer"}
+            </div>
+        </div>
+    );
+}
 
 export default function MeetingRoom() {
     const { roomId } = useParams<{ roomId: string }>();
@@ -36,41 +83,96 @@ export default function MeetingRoom() {
     // Media stream references
     const localVideoRef = useRef<HTMLVideoElement>(null);
     const localStreamRef = useRef<MediaStream | null>(null);
+    const [localStream, setLocalStream] = useState<MediaStream | null>(null);
     
-    // Connected users state
+    // WebRTC Peer connections & remote streams
+    const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map());
     const [peers, setPeers] = useState<{ socketId: string; user: any }[]>([]);
+    const [remoteStreams, setRemoteStreams] = useState<{ [socketId: string]: MediaStream }>({});
 
-    // 1. Hook up Camera & Mic inside Lobby
-    useEffect(() => {
-        if (inLobby && camEnabled) {
-            startCamera();
-        } else {
-            stopCamera();
-        }
-        return () => stopCamera();
-    }, [inLobby, camEnabled]);
-
+    // 1. Camera Initialization
     const startCamera = async () => {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: true,
-                audio: true
-            });
+            let stream: MediaStream;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: "user",
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    },
+                    audio: true
+                });
+            } catch (bothErr) {
+                console.warn("Could not access video+audio together, trying video only:", bothErr);
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: true,
+                    audio: false
+                });
+            }
+
             localStreamRef.current = stream;
+            setLocalStream(stream);
+            setCamEnabled(true);
+            const hasAudio = stream.getAudioTracks().length > 0 && stream.getAudioTracks()[0].enabled;
+            setMicEnabled(hasAudio);
+
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = stream;
+                localVideoRef.current.play().catch(() => {});
             }
-        } catch (err) {
-            console.warn("Could not access camera/mic: ", err);
+
+            // Replace tracks on any existing peer connections
+            peersRef.current.forEach((pc) => {
+                stream.getTracks().forEach((track) => {
+                    const sender = pc.getSenders().find((s) => s.track?.kind === track.kind);
+                    if (sender) {
+                        sender.replaceTrack(track);
+                    } else {
+                        pc.addTrack(track, stream);
+                    }
+                });
+            });
+
+            return stream;
+        } catch (err: any) {
+            console.error("Camera access failed completely:", err);
+            toast.error("Could not access camera/mic. Please check browser permissions.");
+            setCamEnabled(false);
+            return null;
         }
     };
 
     const stopCamera = () => {
         if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach(track => track.stop());
+            localStreamRef.current.getTracks().forEach((track) => track.stop());
             localStreamRef.current = null;
+            setLocalStream(null);
+        }
+        if (localVideoRef.current) {
+            localVideoRef.current.srcObject = null;
         }
     };
+
+    // Initialize camera on mount and cleanup on unmount
+    useEffect(() => {
+        startCamera();
+        return () => {
+            stopCamera();
+        };
+    }, []);
+
+    // Reattach localStream whenever localVideoRef element re-mounts (e.g. Lobby -> Room transition)
+    useEffect(() => {
+        if (localVideoRef.current) {
+            if (localStream && camEnabled) {
+                localVideoRef.current.srcObject = localStream;
+                localVideoRef.current.play().catch(() => {});
+            } else {
+                localVideoRef.current.srcObject = null;
+            }
+        }
+    }, [localStream, inLobby, camEnabled]);
 
     // 2. Fetch Meeting details on load
     useEffect(() => {
@@ -81,6 +183,58 @@ export default function MeetingRoom() {
             });
         }
     }, [roomId, joinMeeting, navigate]);
+
+    // Helper: Create an RTCPeerConnection for a target peer
+    const createPeerConnection = (targetSocketId: string) => {
+        if (peersRef.current.has(targetSocketId)) {
+            return peersRef.current.get(targetSocketId)!;
+        }
+
+        const pc = new RTCPeerConnection(ICE_SERVERS);
+        peersRef.current.set(targetSocketId, pc);
+
+        // Add local tracks if available
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((track) => {
+                pc.addTrack(track, localStreamRef.current!);
+            });
+        }
+
+        // Send ICE candidate to peer
+        pc.onicecandidate = (event) => {
+            if (event.candidate) {
+                socket.emit("ice-candidate", {
+                    target: targetSocketId,
+                    candidate: event.candidate
+                });
+            }
+        };
+
+        // Receive remote track
+        pc.ontrack = (event) => {
+            const stream = event.streams[0] || new MediaStream([event.track]);
+            setRemoteStreams((prev) => ({
+                ...prev,
+                [targetSocketId]: stream
+            }));
+        };
+
+        pc.onconnectionstatechange = () => {
+            if (
+                pc.connectionState === "disconnected" ||
+                pc.connectionState === "failed" ||
+                pc.connectionState === "closed"
+            ) {
+                setRemoteStreams((prev) => {
+                    const next = { ...prev };
+                    delete next[targetSocketId];
+                    return next;
+                });
+            }
+        };
+
+        return pc;
+    };
 
     // 3. Connect Sockets and WebRTC signalling on joining
     const handleJoinRoom = () => {
@@ -94,24 +248,99 @@ export default function MeetingRoom() {
         socket.emit("join-room", { roomId, user });
 
         // Listeners
-        socket.on("all-users", (usersList: { socketId: string; user: any }[]) => {
+        socket.on("all-users", async (usersList: { socketId: string; user: any }[]) => {
             setPeers(usersList);
             toast.success("Successfully connected to meeting server");
+
+            // Initiate WebRTC peer connections with everyone currently in the room
+            for (const peer of usersList) {
+                try {
+                    const pc = createPeerConnection(peer.socketId);
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    socket.emit("sending-signal", {
+                        userToSignal: peer.socketId,
+                        callerId: socket.id,
+                        callerUser: user,
+                        signal: offer
+                    });
+                } catch (err) {
+                    console.error("Failed to create offer for peer:", peer.socketId, err);
+                }
+            }
         });
 
         socket.on("user-connected", ({ socketId, user: joiningUser }) => {
-            setPeers((prev) => [...prev, { socketId, user: joiningUser }]);
+            setPeers((prev) => {
+                if (prev.some((p) => p.socketId === socketId)) return prev;
+                return [...prev, { socketId, user: joiningUser }];
+            });
             toast.success(`${joiningUser.fullName} joined the call`);
         });
 
+        // Receiving an offer from a newcomer
+        socket.on("user-joined-signal", async ({ callerId, callerUser, signal }) => {
+            try {
+                setPeers((prev) => {
+                    if (prev.some((p) => p.socketId === callerId)) return prev;
+                    return [...prev, { socketId: callerId, user: callerUser }];
+                });
+
+                const pc = createPeerConnection(callerId);
+                await pc.setRemoteDescription(new RTCSessionDescription(signal));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+
+                socket.emit("returning-signal", {
+                    callerId,
+                    signal: answer
+                });
+            } catch (err) {
+                console.error("Failed to answer incoming WebRTC call from:", callerId, err);
+            }
+        });
+
+        // Receiving an answer back from the target peer
+        socket.on("receiving-returned-signal", async ({ id, signal }) => {
+            try {
+                const pc = peersRef.current.get(id);
+                if (pc && pc.signalingState !== "stable") {
+                    await pc.setRemoteDescription(new RTCSessionDescription(signal));
+                }
+            } catch (err) {
+                console.error("Failed to set remote description from:", id, err);
+            }
+        });
+
+        // Handle incoming ICE candidate
+        socket.on("ice-candidate", async ({ sender, candidate }) => {
+            try {
+                const pc = peersRef.current.get(sender);
+                if (pc && candidate) {
+                    await pc.addIceCandidate(new RTCIceCandidate(candidate));
+                }
+            } catch (err) {
+                console.warn("Failed to add ICE candidate from:", sender, err);
+            }
+        });
+
         socket.on("user-disconnected", ({ socketId, name }) => {
+            const pc = peersRef.current.get(socketId);
+            if (pc) {
+                pc.close();
+                peersRef.current.delete(socketId);
+            }
+            setRemoteStreams((prev) => {
+                const next = { ...prev };
+                delete next[socketId];
+                return next;
+            });
             setPeers((prev) => prev.filter((p) => p.socketId !== socketId));
-            toast.success(`${name} left the call`);
+            toast.success(`${name || "A participant"} left the call`);
         });
 
         socket.on("receive-message", (msg: TranscriptItem) => {
             setMessages((prev) => [...prev, msg]);
-            // If the message is from another user, display as live caption
             setLiveCaptionText(`${msg.sender}: ${msg.text}`);
         });
 
@@ -119,8 +348,6 @@ export default function MeetingRoom() {
             setTypingUser(isTyping ? userName : "");
         });
 
-        // Trigger some automatic AI simulated interactions if the user is alone after 10s
-        // to make the demo feel premium and alive
         const botTimer = setTimeout(() => {
             simulateTeammateTalk();
         }, 15000);
@@ -130,15 +357,21 @@ export default function MeetingRoom() {
         };
     };
 
-    // Clean up sockets on unmount
+    // Clean up sockets & WebRTC peers on unmount
     useEffect(() => {
         return () => {
             socket.off("all-users");
             socket.off("user-connected");
+            socket.off("user-joined-signal");
+            socket.off("receiving-returned-signal");
+            socket.off("ice-candidate");
             socket.off("user-disconnected");
             socket.off("receive-message");
             socket.off("user-typing");
             socket.disconnect();
+
+            peersRef.current.forEach((pc) => pc.close());
+            peersRef.current.clear();
         };
     }, []);
 
@@ -164,28 +397,42 @@ export default function MeetingRoom() {
         }
     };
 
-    // 5. Mute Toggles
+    // 5. Mute & Camera Toggles
     const toggleMic = () => {
-        if (localStreamRef.current) {
-            const audioTrack = localStreamRef.current.getAudioTracks()[0];
-            if (audioTrack) {
-                audioTrack.enabled = !micEnabled;
-                setMicEnabled(!micEnabled);
-            }
+        if (!localStreamRef.current || localStreamRef.current.getAudioTracks().length === 0) {
+            setMicEnabled(!micEnabled);
+            return;
+        }
+
+        const audioTrack = localStreamRef.current.getAudioTracks()[0];
+        if (audioTrack) {
+            audioTrack.enabled = !micEnabled;
+            setMicEnabled(!micEnabled);
         } else {
             setMicEnabled(!micEnabled);
         }
     };
 
-    const toggleCam = () => {
-        if (localStreamRef.current) {
-            const videoTrack = localStreamRef.current.getVideoTracks()[0];
-            if (videoTrack) {
-                videoTrack.enabled = !camEnabled;
-                setCamEnabled(!camEnabled);
+    const toggleCam = async () => {
+        if (!localStreamRef.current || localStreamRef.current.getVideoTracks().length === 0) {
+            await startCamera();
+            return;
+        }
+
+        const videoTrack = localStreamRef.current.getVideoTracks()[0];
+        if (videoTrack) {
+            const nextState = !camEnabled;
+            videoTrack.enabled = nextState;
+            setCamEnabled(nextState);
+
+            if (!nextState && localVideoRef.current) {
+                localVideoRef.current.srcObject = null;
+            } else if (nextState && localVideoRef.current) {
+                localVideoRef.current.srcObject = localStreamRef.current;
+                localVideoRef.current.play().catch(() => {});
             }
         } else {
-            setCamEnabled(!camEnabled);
+            await startCamera();
         }
     };
 
@@ -195,15 +442,32 @@ export default function MeetingRoom() {
                 const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
                 if (localVideoRef.current) {
                     localVideoRef.current.srcObject = stream;
+                    localVideoRef.current.play().catch(() => {});
                 }
                 setScreenSharing(true);
                 toast.success("Sharing your screen");
                 
+                const screenTrack = stream.getVideoTracks()[0];
+                peersRef.current.forEach((pc) => {
+                    const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+                    if (sender) {
+                        sender.replaceTrack(screenTrack);
+                    }
+                });
+
                 // When user stops screen sharing from browser control
-                stream.getVideoTracks()[0].onended = () => {
+                screenTrack.onended = () => {
                     setScreenSharing(false);
                     if (localStreamRef.current && localVideoRef.current) {
                         localVideoRef.current.srcObject = localStreamRef.current;
+                        localVideoRef.current.play().catch(() => {});
+                        const camTrack = localStreamRef.current.getVideoTracks()[0];
+                        if (camTrack) {
+                            peersRef.current.forEach((pc) => {
+                                const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+                                if (sender) sender.replaceTrack(camTrack);
+                            });
+                        }
                     }
                 };
             } catch (err) {
@@ -213,6 +477,14 @@ export default function MeetingRoom() {
             setScreenSharing(false);
             if (localStreamRef.current && localVideoRef.current) {
                 localVideoRef.current.srcObject = localStreamRef.current;
+                localVideoRef.current.play().catch(() => {});
+                const camTrack = localStreamRef.current.getVideoTracks()[0];
+                if (camTrack) {
+                    peersRef.current.forEach((pc) => {
+                        const sender = pc.getSenders().find((s) => s.track?.kind === "video");
+                        if (sender) sender.replaceTrack(camTrack);
+                    });
+                }
             }
         }
     };
@@ -222,10 +494,8 @@ export default function MeetingRoom() {
         setChatInput(e.target.value);
         if (!roomId || !user) return;
 
-        // Emit typing
         socket.emit("typing", { roomId, userName: user.fullName, isTyping: true });
 
-        // Debounce typing status
         if (typingTimeout) clearTimeout(typingTimeout);
         
         setTypingTimeout(
@@ -245,13 +515,9 @@ export default function MeetingRoom() {
             timestamp: new Date().toISOString()
         };
 
-        // Emit to socket room
         socket.emit("send-message", { roomId, message: messageData });
-        
-        // Save to Database transcript list
         addTranscriptMessage(roomId, user.fullName, chatInput.trim());
 
-        // Cancel typing status
         socket.emit("typing", { roomId, userName: user.fullName, isTyping: false });
         if (typingTimeout) clearTimeout(typingTimeout);
 
@@ -263,10 +529,8 @@ export default function MeetingRoom() {
         e.preventDefault();
         if (!captionInput.trim() || !roomId || !user) return;
 
-        // Simulate speaking in room (it adds to transcript database)
         addTranscriptMessage(roomId, user.fullName, captionInput.trim());
 
-        // Display as caption and chat
         const msg = {
             sender: user.fullName,
             text: captionInput.trim(),
@@ -283,7 +547,9 @@ export default function MeetingRoom() {
     const handleLeaveMeeting = () => {
         socket.disconnect();
         stopCamera();
-        toast.success("You left the meeting room lobby");
+        peersRef.current.forEach((pc) => pc.close());
+        peersRef.current.clear();
+        toast.success("You left the meeting room");
         navigate("/dashboard");
     };
 
@@ -293,6 +559,9 @@ export default function MeetingRoom() {
         if (!confirm) return;
 
         try {
+            stopCamera();
+            peersRef.current.forEach((pc) => pc.close());
+            peersRef.current.clear();
             await endMeeting(roomId);
             toast.success("Meeting ended! AI analysis ready.");
             navigate(`/meeting/${roomId}/summary`);
@@ -312,7 +581,7 @@ export default function MeetingRoom() {
                     <div className="flex-1 space-y-4">
                         <h2 className="text-xl font-bold">Lobby Hardware Setup</h2>
                         <div className="aspect-video w-full rounded-2xl bg-black/60 border border-white/5 relative overflow-hidden flex items-center justify-center">
-                            {camEnabled ? (
+                            {camEnabled && localStream ? (
                                 <video 
                                     ref={localVideoRef} 
                                     autoPlay 
@@ -331,7 +600,7 @@ export default function MeetingRoom() {
 
                             {/* Camera overlay indicators */}
                             <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-[10px] text-neutral-300 font-semibold border border-white/5 flex items-center gap-1.5">
-                                <span className={`w-2 h-2 rounded-full ${camEnabled ? "bg-emerald-500" : "bg-red-500"}`}></span>
+                                <span className={`w-2 h-2 rounded-full ${camEnabled && localStream ? "bg-emerald-500" : "bg-red-500"}`}></span>
                                 {user?.fullName}
                             </div>
                         </div>
@@ -388,13 +657,13 @@ export default function MeetingRoom() {
                         <div className="space-y-2.5">
                             <button
                                 onClick={handleJoinRoom}
-                                className="w-full glow-btn bg-violet-600 hover:bg-violet-500 text-sm font-semibold py-3.5 rounded-xl"
+                                className="w-full glow-btn bg-violet-600 hover:bg-violet-500 text-sm font-semibold py-3.5 rounded-xl cursor-pointer"
                             >
                                 Enter Meeting Room
                             </button>
                             <button
                                 onClick={() => navigate("/dashboard")}
-                                className="w-full border border-white/10 hover:bg-white/5 text-sm font-semibold py-3.5 rounded-xl transition-all"
+                                className="w-full border border-white/10 hover:bg-white/5 text-sm font-semibold py-3.5 rounded-xl transition-all cursor-pointer"
                             >
                                 Back to Dashboard
                             </button>
@@ -434,7 +703,7 @@ export default function MeetingRoom() {
                     <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 items-center justify-center min-h-[300px]">
                         {/* Tile 1: Local Stream */}
                         <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center group">
-                            {camEnabled ? (
+                            {camEnabled && localStream ? (
                                 <video 
                                     ref={localVideoRef} 
                                     autoPlay 
@@ -453,31 +722,19 @@ export default function MeetingRoom() {
 
                             {/* User details */}
                             <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
-                                <span className={`w-1.5 h-1.5 rounded-full ${camEnabled ? "bg-emerald-500" : "bg-red-500"}`}></span>
+                                <span className={`w-1.5 h-1.5 rounded-full ${camEnabled && localStream ? "bg-emerald-500" : "bg-red-500"}`}></span>
                                 {user?.fullName} (You)
                             </div>
                         </div>
 
-                        {/* Tile 2: Remote Peer Stream (WebRTC or simulation) */}
+                        {/* Tile 2+: Remote Peer Video Streams */}
                         {peers.length > 0 ? (
                             peers.map((peer) => (
-                                <div 
-                                    key={peer.socketId} 
-                                    className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center"
-                                >
-                                    {/* Simulating camera streams */}
-                                    <div className="text-center space-y-2">
-                                        <div className="w-16 h-16 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-400 font-extrabold text-lg flex items-center justify-center mx-auto">
-                                            {peer.user?.fullName.charAt(0).toUpperCase() || "P"}
-                                        </div>
-                                        <span className="text-xs text-neutral-400 block">{peer.user?.fullName}</span>
-                                    </div>
-
-                                    <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
-                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                                        {peer.user?.fullName}
-                                    </div>
-                                </div>
+                                <RemoteVideoTile
+                                    key={peer.socketId}
+                                    peer={peer}
+                                    stream={remoteStreams[peer.socketId]}
+                                />
                             ))
                         ) : (
                             // Simulated slide presentation when testing solo
@@ -516,7 +773,7 @@ export default function MeetingRoom() {
                     <div className="flex border-b border-white/5">
                         <button
                             onClick={() => setActiveTab("chat")}
-                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 ${
+                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 cursor-pointer ${
                                 activeTab === "chat" 
                                     ? "border-violet-600 text-violet-400 bg-white/5" 
                                     : "border-transparent text-neutral-400 hover:text-white"
@@ -526,7 +783,7 @@ export default function MeetingRoom() {
                         </button>
                         <button
                             onClick={() => setActiveTab("notes")}
-                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 ${
+                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 cursor-pointer ${
                                 activeTab === "notes" 
                                     ? "border-violet-600 text-violet-400 bg-white/5" 
                                     : "border-transparent text-neutral-400 hover:text-white"
@@ -536,7 +793,7 @@ export default function MeetingRoom() {
                         </button>
                         <button
                             onClick={() => setActiveTab("participants")}
-                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 ${
+                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 cursor-pointer ${
                                 activeTab === "participants" 
                                     ? "border-violet-600 text-violet-400 bg-white/5" 
                                     : "border-transparent text-neutral-400 hover:text-white"
@@ -592,7 +849,7 @@ export default function MeetingRoom() {
                                     />
                                     <button 
                                         type="submit" 
-                                        className="w-10 h-10 rounded-xl bg-violet-600 hover:bg-violet-500 flex items-center justify-center shrink-0 shadow shadow-violet-500/20"
+                                        className="w-10 h-10 rounded-xl bg-violet-600 hover:bg-violet-500 flex items-center justify-center shrink-0 shadow shadow-violet-500/20 cursor-pointer"
                                     >
                                         <Send className="w-4 h-4 text-white" />
                                     </button>
@@ -616,7 +873,7 @@ export default function MeetingRoom() {
                                         onClick={() => {
                                             toast.success("Notes saved to local storage!");
                                         }}
-                                        className="bg-white/5 border border-white/10 hover:bg-white/10 text-xs px-4 py-2 rounded-xl transition-all"
+                                        className="bg-white/5 border border-white/10 hover:bg-white/10 text-xs px-4 py-2 rounded-xl transition-all cursor-pointer"
                                     >
                                         Save Draft
                                     </button>
@@ -644,7 +901,7 @@ export default function MeetingRoom() {
                                     <div key={peer.socketId} className="flex items-center justify-between p-2.5 rounded-xl border border-white/5 bg-[#12131a]">
                                         <div className="flex items-center gap-2 text-xs">
                                             <div className="w-5 h-5 rounded-full bg-violet-600/20 text-violet-400 font-bold text-[10px] flex items-center justify-center">
-                                                {peer.user?.fullName.charAt(0).toUpperCase() || "P"}
+                                                {peer.user?.fullName?.charAt(0).toUpperCase() || "P"}
                                             </div>
                                             <span className="font-semibold text-neutral-300">{peer.user?.fullName}</span>
                                         </div>
@@ -663,7 +920,7 @@ export default function MeetingRoom() {
                 <div className="flex items-center gap-3">
                     <button
                         onClick={toggleMic}
-                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all ${
+                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all cursor-pointer ${
                             micEnabled 
                                 ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
                                 : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
@@ -674,7 +931,7 @@ export default function MeetingRoom() {
                     </button>
                     <button
                         onClick={toggleCam}
-                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all ${
+                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all cursor-pointer ${
                             camEnabled 
                                 ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
                                 : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
@@ -685,7 +942,7 @@ export default function MeetingRoom() {
                     </button>
                     <button
                         onClick={toggleScreenSharing}
-                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all ${
+                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all cursor-pointer ${
                             screenSharing 
                                 ? "bg-violet-600/15 border-violet-500/30 text-violet-400 hover:bg-violet-500/25" 
                                 : "bg-white/5 border-white/10 text-white hover:bg-white/10"
@@ -711,8 +968,8 @@ export default function MeetingRoom() {
                         />
                     </div>
                     <button 
-                        type="submit"
-                        className="bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold px-3 py-2 rounded-xl transition-all"
+                        type="submit" 
+                        className="bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold px-3 py-2 rounded-xl transition-all cursor-pointer"
                     >
                         Speak
                     </button>
@@ -722,13 +979,13 @@ export default function MeetingRoom() {
                 <div className="flex items-center gap-3">
                     <button
                         onClick={handleLeaveMeeting}
-                        className="flex items-center gap-1.5 text-xs border border-white/10 hover:bg-white/5 text-neutral-300 px-4 py-2 rounded-xl font-semibold transition-all"
+                        className="flex items-center gap-1.5 text-xs border border-white/10 hover:bg-white/5 text-neutral-300 px-4 py-2 rounded-xl font-semibold transition-all cursor-pointer"
                     >
                         <LogOut className="w-3.5 h-3.5" /> Leave Lobby
                     </button>
                     <button
                         onClick={handleEndMeeting}
-                        className="flex items-center gap-1.5 text-xs bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-xl font-bold shadow shadow-red-500/20 transition-all"
+                        className="flex items-center gap-1.5 text-xs bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-xl font-bold shadow shadow-red-500/20 transition-all cursor-pointer"
                     >
                         End Call (AI Summary)
                     </button>
