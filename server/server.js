@@ -33,13 +33,14 @@ const startServer = async () => {
 
             // 1. Join room
             socket.on("join-room", ({ roomId, user }) => {
-                socket.join(roomId);
-                activeConnections.set(socket.id, { roomId, user });
+                const cleanRoomId = roomId ? String(roomId).trim().toLowerCase().replace(/[^a-z0-9-]/g, "") : roomId;
+                socket.join(cleanRoomId);
+                activeConnections.set(socket.id, { roomId: cleanRoomId, user });
 
-                console.log(`👤 User "${user.fullName}" (${user._id}) joined room: ${roomId}`);
+                console.log(`👤 User "${user.fullName}" (${user._id}) joined room: ${cleanRoomId}`);
 
                 // Fetch other sockets in this room to establish WebRTC connections
-                const clientsInRoom = io.sockets.adapter.rooms.get(roomId);
+                const clientsInRoom = io.sockets.adapter.rooms.get(cleanRoomId);
                 const otherUserSockets = [];
                 
                 if (clientsInRoom) {
@@ -58,7 +59,7 @@ const startServer = async () => {
                 socket.emit("all-users", otherUserSockets);
 
                 // Notify other users that a new user connected
-                socket.to(roomId).emit("user-connected", {
+                socket.to(cleanRoomId).emit("user-connected", {
                     socketId: socket.id,
                     user: user
                 });

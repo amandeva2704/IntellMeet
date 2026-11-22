@@ -4,9 +4,23 @@ import { useStore } from "../store/store";
 import { 
     Video, Plus, LogOut, Layout, Users, 
     ClipboardList, CheckSquare, PlusCircle, 
-    UserPlus, ArrowRight, VideoOff, History, Bot
+    UserPlus, ArrowRight, VideoOff, History, Bot, Copy
 } from "lucide-react";
 import toast from "react-hot-toast";
+
+const normalizeRoomId = (input: string): string => {
+    if (!input) return "";
+    let clean = input.trim();
+    if (clean.includes("/")) {
+        clean = clean.split("/").filter(Boolean).pop() || clean;
+    }
+    clean = clean.split("?")[0].split("#")[0].trim().toLowerCase();
+    const alphanumeric = clean.replace(/[^a-z0-9]/g, "");
+    if (alphanumeric.length === 9) {
+        return `${alphanumeric.substring(0, 3)}-${alphanumeric.substring(3, 6)}-${alphanumeric.substring(6, 9)}`;
+    }
+    return clean;
+};
 
 export default function Dashboard() {
     const navigate = useNavigate();
@@ -84,18 +98,18 @@ export default function Dashboard() {
 
     const handleJoinMeeting = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!joinRoomId.trim()) {
-            toast.error("Please enter a valid Meeting ID");
+        const cleanedRoomId = normalizeRoomId(joinRoomId);
+        if (!cleanedRoomId) {
+            toast.error("Please enter a valid Meeting ID or invite link");
             return;
         }
         try {
             setIsLoadingMeeting(true);
-            const cleanedRoomId = joinRoomId.trim();
             const meeting = await joinMeeting(cleanedRoomId);
             toast.success("Joined room lobby");
             navigate(`/meeting/${meeting.roomId}`);
         } catch (err: any) {
-            toast.error(err.message || "Failed to join meeting room");
+            toast.error(err.message || "Meeting room not found");
         } finally {
             setIsLoadingMeeting(false);
         }
@@ -294,9 +308,12 @@ export default function Dashboard() {
                             <form onSubmit={handleJoinMeeting} className="space-y-3">
                                 <input
                                     type="text"
-                                    placeholder="Meeting Room ID (format: xxx-xxx-xxx)"
+                                    placeholder="Meeting Room ID or Link (e.g. 351-c4d-c01)"
                                     value={joinRoomId}
                                     onChange={(e) => setJoinRoomId(e.target.value)}
+                                    autoCapitalize="none"
+                                    autoCorrect="off"
+                                    spellCheck={false}
                                     className="w-full text-xs px-3 py-2.5 rounded-xl glass-input"
                                     required
                                 />
@@ -461,9 +478,25 @@ export default function Dashboard() {
                                                 </span>
                                             </div>
                                             <h4 className="font-bold text-sm text-white truncate">{meet.title}</h4>
-                                            <span className="text-[11px] text-neutral-400 block truncate">
-                                                Room ID: {meet.roomId}
-                                            </span>
+                                            <div className="flex items-center justify-between mt-1">
+                                                <span className="text-[11px] text-neutral-400 font-mono block truncate">
+                                                    ID: {meet.roomId}
+                                                </span>
+                                                <button
+                                                    type="button"
+                                                    onClick={(e) => {
+                                                        e.preventDefault();
+                                                        e.stopPropagation();
+                                                        const url = `${window.location.origin}/meeting/${meet.roomId}`;
+                                                        navigator.clipboard.writeText(url);
+                                                        toast.success("Meeting link copied!", { icon: "📋" });
+                                                    }}
+                                                    title="Copy Meeting Invite Link"
+                                                    className="text-[10px] text-violet-400 hover:text-violet-300 font-semibold flex items-center gap-1 bg-violet-500/10 hover:bg-violet-500/20 px-2 py-0.5 rounded border border-violet-500/20 cursor-pointer transition-all"
+                                                >
+                                                    <Copy className="w-2.5 h-2.5" /> Copy Link
+                                                </button>
+                                            </div>
                                         </div>
 
                                         <div className="flex items-center justify-between border-t border-white/5 pt-3">

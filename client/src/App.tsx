@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { useStore } from "./store/store";
 import { Toaster } from "react-hot-toast";
 import { Loader2 } from "lucide-react";
@@ -18,6 +18,7 @@ import Analytics from "./pages/Analytics";
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
     const { isAuthenticated, fetchProfile, token } = useStore();
     const [checking, setChecking] = useState(true);
+    const location = useLocation();
 
     useEffect(() => {
         const verifyUser = async () => {
@@ -41,7 +42,8 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
         );
     }
 
-    return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />;
+    const redirectPath = encodeURIComponent(location.pathname + location.search);
+    return isAuthenticated ? <>{children}</> : <Navigate to={`/login?redirect=${redirectPath}`} replace />;
 }
 
 // Public Route Guard (Redirects to dashboard if already logged in)

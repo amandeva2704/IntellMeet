@@ -6,9 +6,23 @@ import { socket } from "../services/socket";
 import { 
     Mic, MicOff, Video as VideoIcon, VideoOff, 
     Monitor, MessageSquare, ListTodo, Users, 
-    Send, LogOut, Bot
+    Send, LogOut, Bot, Copy
 } from "lucide-react";
 import toast from "react-hot-toast";
+
+const normalizeRoomId = (input?: string): string => {
+    if (!input) return "";
+    let clean = input.trim();
+    if (clean.includes("/")) {
+        clean = clean.split("/").filter(Boolean).pop() || clean;
+    }
+    clean = clean.split("?")[0].split("#")[0].trim().toLowerCase();
+    const alphanumeric = clean.replace(/[^a-z0-9]/g, "");
+    if (alphanumeric.length === 9) {
+        return `${alphanumeric.substring(0, 3)}-${alphanumeric.substring(3, 6)}-${alphanumeric.substring(6, 9)}`;
+    }
+    return clean;
+};
 
 const ICE_SERVERS: RTCConfiguration = {
     iceServers: [
@@ -177,12 +191,14 @@ export default function MeetingRoom() {
     // 2. Fetch Meeting details on load
     useEffect(() => {
         if (roomId) {
-            joinMeeting(roomId).catch(() => {
-                toast.error("Invalid meeting room ID");
+            const cleanId = normalizeRoomId(roomId);
+            joinMeeting(cleanId).catch((err: any) => {
+                console.error("Meeting join failed:", err);
+                toast.error(err.message || "Meeting room not found");
                 navigate("/dashboard");
             });
         }
-    }, [roomId, joinMeeting, navigate]);
+    }, [roomId]);
 
     // Helper: Create an RTCPeerConnection for a target peer
     const createPeerConnection = (targetSocketId: string) => {
@@ -638,7 +654,21 @@ export default function MeetingRoom() {
                             <div>
                                 <span className="text-[10px] font-bold uppercase tracking-wider text-violet-400">Ready to join?</span>
                                 <h1 className="text-2xl font-extrabold tracking-tight mt-1">{activeMeeting?.title || "IntellMeet Room"}</h1>
-                                <span className="text-xs text-neutral-400 block mt-1">Room ID: {roomId}</span>
+                                <div className="flex items-center gap-2 mt-1">
+                                    <span className="text-xs text-neutral-400 font-mono">Room ID: {roomId}</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            const url = `${window.location.origin}/meeting/${roomId}`;
+                                            navigator.clipboard.writeText(url);
+                                            toast.success("Meeting link copied!", { icon: "📋" });
+                                        }}
+                                        className="text-[10px] text-violet-400 hover:text-violet-300 font-semibold flex items-center gap-1 bg-violet-500/10 hover:bg-violet-500/20 px-2 py-0.5 rounded border border-violet-500/20 cursor-pointer transition-all"
+                                        title="Copy Meeting Invite Link"
+                                    >
+                                        <Copy className="w-2.5 h-2.5" /> Copy Invite Link
+                                    </button>
+                                </div>
                             </div>
 
                             <div className="bg-white/5 border border-white/5 p-4 rounded-2xl space-y-2">
@@ -685,6 +715,18 @@ export default function MeetingRoom() {
                     </span>
                     <h2 className="text-sm font-bold truncate max-w-xs">{activeMeeting?.title}</h2>
                     <span className="text-[10px] text-neutral-400 hidden sm:inline">({roomId})</span>
+                    <button
+                        type="button"
+                        onClick={() => {
+                            const url = `${window.location.origin}/meeting/${roomId}`;
+                            navigator.clipboard.writeText(url);
+                            toast.success("Meeting link copied!", { icon: "📋" });
+                        }}
+                        className="text-[10px] text-violet-400 hover:text-violet-300 font-semibold flex items-center gap-1 bg-violet-500/10 hover:bg-violet-500/20 px-2 py-1 rounded border border-violet-500/20 cursor-pointer transition-all"
+                        title="Copy Meeting Invite Link"
+                    >
+                        <Copy className="w-2.5 h-2.5" /> Copy Invite Link
+                    </button>
                 </div>
 
                 <div className="flex items-center gap-3">

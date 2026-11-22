@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useStore } from "../store/store";
 import { Video, Mail, Lock, User as UserIcon, Loader2, ArrowRight } from "lucide-react";
 import toast from "react-hot-toast";
@@ -7,6 +7,10 @@ import toast from "react-hot-toast";
 export default function RegisterPage() {
     const { register, authLoading } = useStore();
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
+    const redirectParam = searchParams.get("redirect");
+    const loginTarget = redirectParam ? `/login?redirect=${encodeURIComponent(redirectParam)}` : "/login";
+
     const [formData, setFormData] = useState({
         fullName: "",
         email: "",
@@ -32,7 +36,7 @@ export default function RegisterPage() {
         try {
             await register(formData);
             toast.success("Account registered successfully! Please log in.");
-            navigate("/login");
+            navigate(loginTarget);
         } catch (error: any) {
             toast.error(error.message || "Failed to register account");
         }

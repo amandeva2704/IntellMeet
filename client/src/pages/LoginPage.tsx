@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useStore } from "../store/store";
 import { Video, Mail, Lock, Loader2, ArrowRight } from "lucide-react";
 import toast from "react-hot-toast";
@@ -7,6 +7,9 @@ import toast from "react-hot-toast";
 export default function LoginPage() {
     const { login, authLoading } = useStore();
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
+    const redirectUrl = searchParams.get("redirect") || "/dashboard";
+
     const [formData, setFormData] = useState({
         email: "",
         password: ""
@@ -26,7 +29,7 @@ export default function LoginPage() {
         try {
             await login(formData);
             toast.success("Logged in successfully!");
-            navigate("/dashboard");
+            navigate(redirectUrl);
         } catch (error: any) {
             toast.error(error.message || "Failed to log in");
         }
