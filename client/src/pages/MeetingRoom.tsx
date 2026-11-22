@@ -1,0 +1,739 @@
+import { useEffect, useRef, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { useStore } from "../store/store";
+import type { TranscriptItem } from "../store/store";
+import { socket } from "../services/socket";
+import { 
+    Mic, MicOff, Video as VideoIcon, VideoOff, 
+    Monitor, MessageSquare, ListTodo, Users, 
+    Send, LogOut, Bot
+} from "lucide-react";
+import toast from "react-hot-toast";
+
+export default function MeetingRoom() {
+    const { roomId } = useParams<{ roomId: string }>();
+    const navigate = useNavigate();
+    const { user, activeMeeting, joinMeeting, endMeeting, addTranscriptMessage } = useStore();
+
+    // UI States
+    const [inLobby, setInLobby] = useState(true);
+    const [micEnabled, setMicEnabled] = useState(true);
+    const [camEnabled, setCamEnabled] = useState(true);
+    const [screenSharing, setScreenSharing] = useState(false);
+    const [activeTab, setActiveTab] = useState<"chat" | "notes" | "participants">("chat");
+
+    // Chat and note states
+    const [messages, setMessages] = useState<TranscriptItem[]>([]);
+    const [chatInput, setChatInput] = useState("");
+    const [meetingNotes, setMeetingNotes] = useState("");
+    const [typingUser, setTypingUser] = useState("");
+    const [typingTimeout, setTypingTimeout] = useState<any>(null);
+
+    // AI Transcription inputs
+    const [captionInput, setCaptionInput] = useState("");
+    const [liveCaptionText, setLiveCaptionText] = useState("AI Voice Assistant: Listening to conversation...");
+
+    // Media stream references
+    const localVideoRef = useRef<HTMLVideoElement>(null);
+    const localStreamRef = useRef<MediaStream | null>(null);
+    
+    // Connected users state
+    const [peers, setPeers] = useState<{ socketId: string; user: any }[]>([]);
+
+    // 1. Hook up Camera & Mic inside Lobby
+    useEffect(() => {
+        if (inLobby && camEnabled) {
+            startCamera();
+        } else {
+            stopCamera();
+        }
+        return () => stopCamera();
+    }, [inLobby, camEnabled]);
+
+    const startCamera = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: true
+            });
+            localStreamRef.current = stream;
+            if (localVideoRef.current) {
+                localVideoRef.current.srcObject = stream;
+            }
+        } catch (err) {
+            console.warn("Could not access camera/mic: ", err);
+        }
+    };
+
+    const stopCamera = () => {
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach(track => track.stop());
+            localStreamRef.current = null;
+        }
+    };
+
+    // 2. Fetch Meeting details on load
+    useEffect(() => {
+        if (roomId) {
+            joinMeeting(roomId).catch(() => {
+                toast.error("Invalid meeting room ID");
+                navigate("/dashboard");
+            });
+        }
+    }, [roomId, joinMeeting, navigate]);
+
+    // 3. Connect Sockets and WebRTC signalling on joining
+    const handleJoinRoom = () => {
+        if (!roomId || !user) return;
+        setInLobby(false);
+
+        // Connect socket
+        socket.connect();
+        
+        // Emit join-room
+        socket.emit("join-room", { roomId, user });
+
+        // Listeners
+        socket.on("all-users", (usersList: { socketId: string; user: any }[]) => {
+            setPeers(usersList);
+            toast.success("Successfully connected to meeting server");
+        });
+
+        socket.on("user-connected", ({ socketId, user: joiningUser }) => {
+            setPeers((prev) => [...prev, { socketId, user: joiningUser }]);
+            toast.success(`${joiningUser.fullName} joined the call`);
+        });
+
+        socket.on("user-disconnected", ({ socketId, name }) => {
+            setPeers((prev) => prev.filter((p) => p.socketId !== socketId));
+            toast.success(`${name} left the call`);
+        });
+
+        socket.on("receive-message", (msg: TranscriptItem) => {
+            setMessages((prev) => [...prev, msg]);
+            // If the message is from another user, display as live caption
+            setLiveCaptionText(`${msg.sender}: ${msg.text}`);
+        });
+
+        socket.on("user-typing", ({ userName, isTyping }) => {
+            setTypingUser(isTyping ? userName : "");
+        });
+
+        // Trigger some automatic AI simulated interactions if the user is alone after 10s
+        // to make the demo feel premium and alive
+        const botTimer = setTimeout(() => {
+            simulateTeammateTalk();
+        }, 15000);
+
+        return () => {
+            clearTimeout(botTimer);
+        };
+    };
+
+    // Clean up sockets on unmount
+    useEffect(() => {
+        return () => {
+            socket.off("all-users");
+            socket.off("user-connected");
+            socket.off("user-disconnected");
+            socket.off("receive-message");
+            socket.off("user-typing");
+            socket.disconnect();
+        };
+    }, []);
+
+    // 4. Simulate other participants talking if alone
+    const simulateTeammateTalk = () => {
+        if (peers.length === 0) {
+            const simulatedTalks = [
+                { sender: "AI Guide", text: "Hey! I will help summarize our progress. Let's make sure we discuss the database config." },
+                { sender: "Sarah (Product)", text: "I will take care of the landing page illustrations this afternoon." },
+                { sender: "James (Backend)", text: "Sure, and I need to deploy the Redis clusters to Kubernetes on Day 5." }
+            ];
+
+            simulatedTalks.forEach((talk, idx) => {
+                setTimeout(() => {
+                    const msg = { sender: talk.sender, text: talk.text, timestamp: new Date().toISOString() };
+                    setMessages((prev) => [...prev, msg]);
+                    setLiveCaptionText(`${talk.sender}: ${talk.text}`);
+                    if (roomId) {
+                        addTranscriptMessage(roomId, talk.sender, talk.text);
+                    }
+                }, (idx + 1) * 8000);
+            });
+        }
+    };
+
+    // 5. Mute Toggles
+    const toggleMic = () => {
+        if (localStreamRef.current) {
+            const audioTrack = localStreamRef.current.getAudioTracks()[0];
+            if (audioTrack) {
+                audioTrack.enabled = !micEnabled;
+                setMicEnabled(!micEnabled);
+            }
+        } else {
+            setMicEnabled(!micEnabled);
+        }
+    };
+
+    const toggleCam = () => {
+        if (localStreamRef.current) {
+            const videoTrack = localStreamRef.current.getVideoTracks()[0];
+            if (videoTrack) {
+                videoTrack.enabled = !camEnabled;
+                setCamEnabled(!camEnabled);
+            }
+        } else {
+            setCamEnabled(!camEnabled);
+        }
+    };
+
+    const toggleScreenSharing = async () => {
+        if (!screenSharing) {
+            try {
+                const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+                if (localVideoRef.current) {
+                    localVideoRef.current.srcObject = stream;
+                }
+                setScreenSharing(true);
+                toast.success("Sharing your screen");
+                
+                // When user stops screen sharing from browser control
+                stream.getVideoTracks()[0].onended = () => {
+                    setScreenSharing(false);
+                    if (localStreamRef.current && localVideoRef.current) {
+                        localVideoRef.current.srcObject = localStreamRef.current;
+                    }
+                };
+            } catch (err) {
+                console.error("Screen share cancel: ", err);
+            }
+        } else {
+            setScreenSharing(false);
+            if (localStreamRef.current && localVideoRef.current) {
+                localVideoRef.current.srcObject = localStreamRef.current;
+            }
+        }
+    };
+
+    // 6. Typing and Chat Handlers
+    const handleChatChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        setChatInput(e.target.value);
+        if (!roomId || !user) return;
+
+        // Emit typing
+        socket.emit("typing", { roomId, userName: user.fullName, isTyping: true });
+
+        // Debounce typing status
+        if (typingTimeout) clearTimeout(typingTimeout);
+        
+        setTypingTimeout(
+            setTimeout(() => {
+                socket.emit("typing", { roomId, userName: user.fullName, isTyping: false });
+            }, 1500)
+        );
+    };
+
+    const handleSendChat = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!chatInput.trim() || !roomId || !user) return;
+
+        const messageData = {
+            sender: user.fullName,
+            text: chatInput.trim(),
+            timestamp: new Date().toISOString()
+        };
+
+        // Emit to socket room
+        socket.emit("send-message", { roomId, message: messageData });
+        
+        // Save to Database transcript list
+        addTranscriptMessage(roomId, user.fullName, chatInput.trim());
+
+        // Cancel typing status
+        socket.emit("typing", { roomId, userName: user.fullName, isTyping: false });
+        if (typingTimeout) clearTimeout(typingTimeout);
+
+        setChatInput("");
+    };
+
+    // 7. Live Custom Speech/Caption submit
+    const handleAddLiveSpeech = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!captionInput.trim() || !roomId || !user) return;
+
+        // Simulate speaking in room (it adds to transcript database)
+        addTranscriptMessage(roomId, user.fullName, captionInput.trim());
+
+        // Display as caption and chat
+        const msg = {
+            sender: user.fullName,
+            text: captionInput.trim(),
+            timestamp: new Date().toISOString()
+        };
+        socket.emit("send-message", { roomId, message: msg });
+
+        setLiveCaptionText(`${user.fullName}: ${captionInput.trim()}`);
+        setCaptionInput("");
+        toast.success("AI Transcribed Speech", { icon: "🎙️" });
+    };
+
+    // 8. End or Leave Meeting
+    const handleLeaveMeeting = () => {
+        socket.disconnect();
+        stopCamera();
+        toast.success("You left the meeting room lobby");
+        navigate("/dashboard");
+    };
+
+    const handleEndMeeting = async () => {
+        if (!roomId) return;
+        const confirm = window.confirm("Are you sure you want to end the meeting for everyone? This triggers AI summary analysis.");
+        if (!confirm) return;
+
+        try {
+            await endMeeting(roomId);
+            toast.success("Meeting ended! AI analysis ready.");
+            navigate(`/meeting/${roomId}/summary`);
+        } catch (err: any) {
+            toast.error(err.message || "Failed to end meeting");
+        }
+    };
+
+    // Render Lobby Frame
+    if (inLobby) {
+        return (
+            <div className="min-h-screen bg-[#08090c] text-white flex items-center justify-center p-4">
+                <div className="w-full max-w-4xl glass-panel rounded-3xl p-6 md:p-10 border border-white/10 flex flex-col md:flex-row gap-8 relative overflow-hidden">
+                    <div className="absolute top-0 left-0 w-40 h-40 bg-violet-600/10 rounded-full blur-3xl pointer-events-none"></div>
+
+                    {/* Left Panel: Camera Setup */}
+                    <div className="flex-1 space-y-4">
+                        <h2 className="text-xl font-bold">Lobby Hardware Setup</h2>
+                        <div className="aspect-video w-full rounded-2xl bg-black/60 border border-white/5 relative overflow-hidden flex items-center justify-center">
+                            {camEnabled ? (
+                                <video 
+                                    ref={localVideoRef} 
+                                    autoPlay 
+                                    playsInline 
+                                    muted 
+                                    className="w-full h-full object-cover scale-x-[-1]"
+                                />
+                            ) : (
+                                <div className="text-center space-y-2">
+                                    <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mx-auto text-neutral-400">
+                                        <VideoOff className="w-6 h-6" />
+                                    </div>
+                                    <span className="text-xs text-neutral-500 block">Camera is Disabled</span>
+                                </div>
+                            )}
+
+                            {/* Camera overlay indicators */}
+                            <div className="absolute bottom-3 left-3 bg-black/60 backdrop-blur-md px-3 py-1 rounded-full text-[10px] text-neutral-300 font-semibold border border-white/5 flex items-center gap-1.5">
+                                <span className={`w-2 h-2 rounded-full ${camEnabled ? "bg-emerald-500" : "bg-red-500"}`}></span>
+                                {user?.fullName}
+                            </div>
+                        </div>
+
+                        {/* Controls */}
+                        <div className="flex items-center justify-center gap-3">
+                            <button
+                                onClick={toggleMic}
+                                className={`w-12 h-12 rounded-xl border flex items-center justify-center transition-all ${
+                                    micEnabled 
+                                        ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
+                                        : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
+                                }`}
+                                title={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
+                            >
+                                {micEnabled ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
+                            </button>
+                            <button
+                                onClick={toggleCam}
+                                className={`w-12 h-12 rounded-xl border flex items-center justify-center transition-all ${
+                                    camEnabled 
+                                        ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
+                                        : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
+                                }`}
+                                title={camEnabled ? "Disable Camera" : "Enable Camera"}
+                            >
+                                {camEnabled ? <VideoIcon className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Right Panel: Lobby Actions */}
+                    <div className="w-full md:w-80 flex flex-col justify-between space-y-6">
+                        <div className="space-y-4">
+                            <div>
+                                <span className="text-[10px] font-bold uppercase tracking-wider text-violet-400">Ready to join?</span>
+                                <h1 className="text-2xl font-extrabold tracking-tight mt-1">{activeMeeting?.title || "IntellMeet Room"}</h1>
+                                <span className="text-xs text-neutral-400 block mt-1">Room ID: {roomId}</span>
+                            </div>
+
+                            <div className="bg-white/5 border border-white/5 p-4 rounded-2xl space-y-2">
+                                <span className="text-[10px] uppercase font-bold text-neutral-400 block">Host Creator</span>
+                                <div className="flex items-center gap-2">
+                                    <div className="w-6 h-6 rounded-full bg-violet-600/20 text-violet-400 font-bold text-xs flex items-center justify-center">
+                                        H
+                                    </div>
+                                    <span className="text-xs font-semibold text-neutral-200">
+                                        Organizer Ref: {activeMeeting?.host ? "Assigned" : "Guest Mode"}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="space-y-2.5">
+                            <button
+                                onClick={handleJoinRoom}
+                                className="w-full glow-btn bg-violet-600 hover:bg-violet-500 text-sm font-semibold py-3.5 rounded-xl"
+                            >
+                                Enter Meeting Room
+                            </button>
+                            <button
+                                onClick={() => navigate("/dashboard")}
+                                className="w-full border border-white/10 hover:bg-white/5 text-sm font-semibold py-3.5 rounded-xl transition-all"
+                            >
+                                Back to Dashboard
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // Active Meeting Room Layout
+    return (
+        <div className="min-h-screen bg-[#08090c] text-white flex flex-col">
+            {/* Top meeting title details */}
+            <header className="h-14 border-b border-white/5 bg-[#0a0b0f] shrink-0 flex items-center justify-between px-6 z-10">
+                <div className="flex items-center gap-3">
+                    <span className="text-sm font-bold text-white uppercase bg-violet-600/10 text-violet-400 border border-violet-500/20 px-2.5 py-0.5 rounded">
+                        Live Room
+                    </span>
+                    <h2 className="text-sm font-bold truncate max-w-xs">{activeMeeting?.title}</h2>
+                    <span className="text-[10px] text-neutral-400 hidden sm:inline">({roomId})</span>
+                </div>
+
+                <div className="flex items-center gap-3">
+                    <div className="bg-white/5 px-2.5 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5">
+                        <Users className="w-3.5 h-3.5 text-indigo-400" />
+                        <span>{peers.length + 1} connected</span>
+                    </div>
+                </div>
+            </header>
+
+            {/* Grid & Chat Split Panel */}
+            <div className="flex-1 flex flex-col lg:flex-row min-h-0 relative">
+                
+                {/* Left Side: Video Tiles */}
+                <div className="flex-1 flex flex-col justify-between p-4 space-y-4 min-h-0">
+                    <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-4 items-center justify-center min-h-[300px]">
+                        {/* Tile 1: Local Stream */}
+                        <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center group">
+                            {camEnabled ? (
+                                <video 
+                                    ref={localVideoRef} 
+                                    autoPlay 
+                                    playsInline 
+                                    muted 
+                                    className="w-full h-full object-cover scale-x-[-1]"
+                                />
+                            ) : (
+                                <div className="text-center space-y-1">
+                                    <div className="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center mx-auto text-neutral-500">
+                                        <VideoOff className="w-5 h-5" />
+                                    </div>
+                                    <span className="text-xs text-neutral-500 block">Cam Feed Disabled</span>
+                                </div>
+                            )}
+
+                            {/* User details */}
+                            <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
+                                <span className={`w-1.5 h-1.5 rounded-full ${camEnabled ? "bg-emerald-500" : "bg-red-500"}`}></span>
+                                {user?.fullName} (You)
+                            </div>
+                        </div>
+
+                        {/* Tile 2: Remote Peer Stream (WebRTC or simulation) */}
+                        {peers.length > 0 ? (
+                            peers.map((peer) => (
+                                <div 
+                                    key={peer.socketId} 
+                                    className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center"
+                                >
+                                    {/* Simulating camera streams */}
+                                    <div className="text-center space-y-2">
+                                        <div className="w-16 h-16 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-400 font-extrabold text-lg flex items-center justify-center mx-auto">
+                                            {peer.user?.fullName.charAt(0).toUpperCase() || "P"}
+                                        </div>
+                                        <span className="text-xs text-neutral-400 block">{peer.user?.fullName}</span>
+                                    </div>
+
+                                    <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
+                                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                                        {peer.user?.fullName}
+                                    </div>
+                                </div>
+                            ))
+                        ) : (
+                            // Simulated slide presentation when testing solo
+                            <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-gradient-to-br from-[#12131a] to-[#1c1d29] border border-violet-500/10 shadow-lg relative overflow-hidden flex flex-col items-center justify-center text-center p-6">
+                                <div className="absolute top-0 right-0 w-24 h-24 bg-violet-600/5 blur-2xl"></div>
+                                <Bot className="w-10 h-10 text-violet-400 mb-2 animate-bounce" />
+                                <h3 className="font-bold text-sm">AI Transcript Core</h3>
+                                <p className="text-xs text-neutral-400 max-w-xs mt-1.5 leading-relaxed">
+                                    Simulating active team listening. Type speech transcriptions in the bottom box to build the smart action summary timeline.
+                                </p>
+                                <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
+                                    <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>
+                                    AI Transcriber Active
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Bottom AI floating caption bar */}
+                    <div className="bg-black/80 backdrop-blur-md border border-white/5 rounded-2xl p-3 max-w-3xl mx-auto w-full flex items-center gap-3.5 shadow-xl">
+                        <div className="w-8 h-8 rounded-lg bg-violet-600/10 border border-violet-500/20 flex items-center justify-center text-violet-400 shrink-0">
+                            <Bot className="w-4 h-4" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                            <span className="text-[10px] uppercase font-bold text-violet-400 tracking-wider">Live Caption Overlay</span>
+                            <p className="text-xs font-medium text-neutral-200 truncate mt-0.5 italic">
+                                "{liveCaptionText}"
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Right Side: Sidebar Panels */}
+                <div className="w-full lg:w-96 border-t lg:border-t-0 lg:border-l border-white/5 bg-[#0a0b0f] flex flex-col shrink-0 min-h-0">
+                    {/* Tab Selection */}
+                    <div className="flex border-b border-white/5">
+                        <button
+                            onClick={() => setActiveTab("chat")}
+                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 ${
+                                activeTab === "chat" 
+                                    ? "border-violet-600 text-violet-400 bg-white/5" 
+                                    : "border-transparent text-neutral-400 hover:text-white"
+                            }`}
+                        >
+                            <MessageSquare className="w-3.5 h-3.5" /> Room Chat
+                        </button>
+                        <button
+                            onClick={() => setActiveTab("notes")}
+                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 ${
+                                activeTab === "notes" 
+                                    ? "border-violet-600 text-violet-400 bg-white/5" 
+                                    : "border-transparent text-neutral-400 hover:text-white"
+                            }`}
+                        >
+                            <ListTodo className="w-3.5 h-3.5" /> Meeting Notes
+                        </button>
+                        <button
+                            onClick={() => setActiveTab("participants")}
+                            className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 border-b-2 ${
+                                activeTab === "participants" 
+                                    ? "border-violet-600 text-violet-400 bg-white/5" 
+                                    : "border-transparent text-neutral-400 hover:text-white"
+                            }`}
+                        >
+                            <Users className="w-3.5 h-3.5" /> Members ({peers.length + 1})
+                        </button>
+                    </div>
+
+                    {/* Tab Contents */}
+                    <div className="flex-1 flex flex-col min-h-0">
+                        {activeTab === "chat" && (
+                            <div className="flex-1 flex flex-col min-h-0 p-4 justify-between">
+                                {/* Message area */}
+                                <div className="flex-1 overflow-y-auto space-y-3 mb-4 pr-1">
+                                    {messages.length === 0 ? (
+                                        <div className="text-center py-10 text-neutral-500 text-xs">
+                                            No messages yet. Send a note to the group chat.
+                                        </div>
+                                    ) : (
+                                        messages.map((msg, index) => (
+                                            <div 
+                                                key={index} 
+                                                className={`p-3 rounded-2xl max-w-[85%] text-xs border ${
+                                                    msg.sender === user?.fullName 
+                                                        ? "ml-auto bg-violet-600/10 border-violet-500/20 text-violet-200" 
+                                                        : "bg-white/5 border-white/5 text-neutral-300"
+                                                }`}
+                                            >
+                                                <div className="flex items-center justify-between gap-4 mb-1 text-[9px] font-bold opacity-60">
+                                                    <span>{msg.sender}</span>
+                                                    <span>{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                                                </div>
+                                                <p className="leading-relaxed break-words">{msg.text}</p>
+                                            </div>
+                                        ))
+                                    )}
+                                    {typingUser && (
+                                        <div className="text-[10px] text-neutral-400 italic font-medium">
+                                            {typingUser} is typing...
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Send chat form */}
+                                <form onSubmit={handleSendChat} className="flex gap-2">
+                                    <input
+                                        type="text"
+                                        placeholder="Type chat message..."
+                                        value={chatInput}
+                                        onChange={handleChatChange}
+                                        className="flex-1 text-xs px-3 py-2 rounded-xl glass-input"
+                                    />
+                                    <button 
+                                        type="submit" 
+                                        className="w-10 h-10 rounded-xl bg-violet-600 hover:bg-violet-500 flex items-center justify-center shrink-0 shadow shadow-violet-500/20"
+                                    >
+                                        <Send className="w-4 h-4 text-white" />
+                                    </button>
+                                </form>
+                            </div>
+                        )}
+
+                        {activeTab === "notes" && (
+                            <div className="flex-1 flex flex-col p-4 justify-between min-h-0">
+                                <div className="flex-1 flex flex-col space-y-3 min-h-0">
+                                    <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400">Meeting Notes Draft</span>
+                                    <textarea
+                                        placeholder="Draft notes, items, goals or documentation discussed during meeting here..."
+                                        value={meetingNotes}
+                                        onChange={(e) => setMeetingNotes(e.target.value)}
+                                        className="flex-1 w-full text-xs p-3 rounded-2xl glass-input resize-none focus:ring-1"
+                                    />
+                                </div>
+                                <div className="mt-4 pt-3 border-t border-white/5 flex justify-end">
+                                    <button 
+                                        onClick={() => {
+                                            toast.success("Notes saved to local storage!");
+                                        }}
+                                        className="bg-white/5 border border-white/10 hover:bg-white/10 text-xs px-4 py-2 rounded-xl transition-all"
+                                    >
+                                        Save Draft
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+
+                        {activeTab === "participants" && (
+                            <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                                <span className="text-[10px] font-bold uppercase tracking-wider text-neutral-400 block mb-2">Connected Peers</span>
+                                
+                                {/* Local */}
+                                <div className="flex items-center justify-between p-2.5 rounded-xl border border-white/5 bg-[#12131a]">
+                                    <div className="flex items-center gap-2 text-xs">
+                                        <div className="w-5 h-5 rounded-full bg-violet-600/20 text-violet-400 font-bold text-[10px] flex items-center justify-center">
+                                            {user?.fullName.charAt(0).toUpperCase()}
+                                        </div>
+                                        <span className="font-semibold text-white">{user?.fullName} (You)</span>
+                                    </div>
+                                    <span className="text-[10px] text-violet-400 font-bold bg-violet-500/10 px-2 py-0.5 rounded">Host</span>
+                                </div>
+
+                                {/* Remotes */}
+                                {peers.map((peer) => (
+                                    <div key={peer.socketId} className="flex items-center justify-between p-2.5 rounded-xl border border-white/5 bg-[#12131a]">
+                                        <div className="flex items-center gap-2 text-xs">
+                                            <div className="w-5 h-5 rounded-full bg-violet-600/20 text-violet-400 font-bold text-[10px] flex items-center justify-center">
+                                                {peer.user?.fullName.charAt(0).toUpperCase() || "P"}
+                                            </div>
+                                            <span className="font-semibold text-neutral-300">{peer.user?.fullName}</span>
+                                        </div>
+                                        <span className="text-[10px] text-neutral-500">Connected</span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* Bottom Meeting Controls */}
+            <footer className="h-20 border-t border-white/5 bg-[#0a0b0f] shrink-0 flex flex-col md:flex-row items-center justify-between px-6 py-3 gap-3 z-10">
+                {/* 1. Mute and camera hardware buttons */}
+                <div className="flex items-center gap-3">
+                    <button
+                        onClick={toggleMic}
+                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all ${
+                            micEnabled 
+                                ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
+                                : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
+                        }`}
+                        title={micEnabled ? "Mute Microphone" : "Unmute Microphone"}
+                    >
+                        {micEnabled ? <Mic className="w-4 h-4" /> : <MicOff className="w-4 h-4" />}
+                    </button>
+                    <button
+                        onClick={toggleCam}
+                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all ${
+                            camEnabled 
+                                ? "bg-white/5 border-white/10 text-white hover:bg-white/10" 
+                                : "bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/25"
+                        }`}
+                        title={camEnabled ? "Disable Camera" : "Enable Camera"}
+                    >
+                        {camEnabled ? <VideoIcon className="w-4 h-4" /> : <VideoOff className="w-4 h-4" />}
+                    </button>
+                    <button
+                        onClick={toggleScreenSharing}
+                        className={`w-10 h-10 rounded-xl border flex items-center justify-center transition-all ${
+                            screenSharing 
+                                ? "bg-violet-600/15 border-violet-500/30 text-violet-400 hover:bg-violet-500/25" 
+                                : "bg-white/5 border-white/10 text-white hover:bg-white/10"
+                        }`}
+                        title={screenSharing ? "Stop Screen Share" : "Share Screen"}
+                    >
+                        <Monitor className="w-4 h-4" />
+                    </button>
+                </div>
+
+                {/* 2. Speak/Transcribe Simulator Panel */}
+                <form onSubmit={handleAddLiveSpeech} className="flex-1 max-w-md w-full flex items-center gap-2">
+                    <div className="relative flex-1">
+                        <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-violet-400">
+                            <Mic className="w-3.5 h-3.5" />
+                        </span>
+                        <input
+                            type="text"
+                            placeholder="Type simulated vocal input (adds to AI Summary)..."
+                            value={captionInput}
+                            onChange={(e) => setCaptionInput(e.target.value)}
+                            className="w-full pl-9 pr-4 py-2 rounded-xl text-xs glass-input focus:border-violet-500"
+                        />
+                    </div>
+                    <button 
+                        type="submit"
+                        className="bg-violet-600 hover:bg-violet-500 text-white text-[11px] font-semibold px-3 py-2 rounded-xl transition-all"
+                    >
+                        Speak
+                    </button>
+                </form>
+
+                {/* 3. Leave and End meeting actions */}
+                <div className="flex items-center gap-3">
+                    <button
+                        onClick={handleLeaveMeeting}
+                        className="flex items-center gap-1.5 text-xs border border-white/10 hover:bg-white/5 text-neutral-300 px-4 py-2 rounded-xl font-semibold transition-all"
+                    >
+                        <LogOut className="w-3.5 h-3.5" /> Leave Lobby
+                    </button>
+                    <button
+                        onClick={handleEndMeeting}
+                        className="flex items-center gap-1.5 text-xs bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-xl font-bold shadow shadow-red-500/20 transition-all"
+                    >
+                        End Call (AI Summary)
+                    </button>
+                </div>
+            </footer>
+        </div>
+    );
+}

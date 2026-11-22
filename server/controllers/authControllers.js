@@ -1,0 +1,172 @@
+const User = require("../model/User");
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
+
+// Check if database is connected
+const checkDBReady = (res) => {
+    if (mongoose.connection.readyState !== 1) {
+        res.status(503).json({
+            success: false,
+            message: "Database is connecting. Please try again in a few seconds."
+        });
+        return false;
+    }
+    return true;
+};
+
+// Register
+exports.register = async (req, res) => {
+    try {
+        if (!checkDBReady(res)) return;
+
+        const { fullName, email, password } = req.body;
+
+        if (!fullName || !email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide fullName, email, and password."
+            });
+        }
+
+        const normalizedEmail = email.toLowerCase().trim();
+
+        const userExists = await User.findOne({ email: normalizedEmail });
+
+        if (userExists) {
+            return res.status(400).json({
+                success: false,
+                message: "Email already exists"
+            });
+        }
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        const user = await User.create({
+            fullName: fullName.trim(),
+            email: normalizedEmail,
+            password: hashedPassword
+        });
+
+        const userResponse = user.toObject();
+        delete userResponse.password;
+
+        const token = jwt.sign(
+            { id: user._id },
+            process.env.JWT_SECRET || "intellmeet_secret_key",
+            { expiresIn: "7d" }
+        );
+
+        res.cookie("token", token, {
+            httpOnly: true,
+            secure: false,
+            sameSite: "lax"
+        });
+
+        res.status(201).json({
+            success: true,
+            message: "User Registered Successfully",
+            user: userResponse,
+            token
+        });
+    } catch (err) {
+        console.error("Register Error:", err);
+        res.status(500).json({
+            success: false,
+            message: err.message || "Failed to register user"
+        });
+    }
+};
+
+// Login
+exports.login = async (req, res) => {
+    try {
+        if (!checkDBReady(res)) return;
+
+        const { email, password } = req.body;
+
+        if (!email || !password) {
+            return res.status(400).json({
+                success: false,
+                message: "Please provide both email and password."
+            });
+        }
+
+        const normalizedEmail = email.toLowerCase().trim();
+
+        const user = await User.findOne({ email: normalizedEmail }).select("+password");
+
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: "User not found with this email"
+            });
+        }
+
+        const isMatch = await bcrypt.compare(password, user.password);
+
+        if (!isMatch) {
+            return res.status(401).json({
+                success: false,
+                message: "Invalid credentials"
+            });
+        }
+
+        const token = jwt.sign(
+            { id: user._id },
+            process.env.JWT_SECRET || "intellmeet_secret_key",
+            { expiresIn: "7d" }
+        );
+
+        res.cookie("token", token, {
+            httpOnly: true,
+            secure: false,
+            sameSite: "lax"
+        });
+
+        const userObj = user.toObject();
+        delete userObj.password;
+
+        res.json({
+            success: true,
+            token,
+            user: userObj
+        });
+    } catch (err) {
+        console.error("Login Error:", err);
+        res.status(500).json({
+            success: false,
+            message: err.message || "Failed to log in"
+        });
+    }
+};
+
+// Logout
+exports.logout = (req, res) => {
+    res.clearCookie("token");
+    res.json({
+        success: true,
+        message: "Logged Out Successfully"
+    });
+};
+
+// Get current user profile
+exports.getProfile = async (req, res) => {
+    try {
+        if (!req.user) {
+            return res.status(401).json({
+                success: false,
+                message: "Not authorized"
+            });
+        }
+        res.status(200).json({
+            success: true,
+            user: req.user
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            message: err.message
+        });
+    }
+};

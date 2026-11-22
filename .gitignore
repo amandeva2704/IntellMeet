@@ -1,0 +1,37 @@
+# Binaries & CLI tools
+agy.exe
+agy.exe.*
+*.exe
+
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Environment files
+.env
+.env.local
+.env.*
+!.env.example
+server/.env
+!server/.env.example
+
+# Build outputs
+client/dist/
+dist/
+build/
+
+# Local database & uploads
+server/.local_mongo_data/
+.local_mongo_data/
+uploads/
+server/uploads/
+
+# Logs
+*.log
+logs/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
