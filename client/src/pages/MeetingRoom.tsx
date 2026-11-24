@@ -25,17 +25,29 @@ const normalizeRoomId = (input?: string): string => {
     return clean;
 };
 
-// Ultra-fast, reliable global STUN configuration with zero pre-gathering delay
+// Ultra-fast, reliable global STUN and TURN relay configuration
 const ICE_SERVERS: RTCConfiguration = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun2.l.google.com:19302" },
-        { urls: "stun:stun3.l.google.com:19302" },
-        { urls: "stun:stun4.l.google.com:19302" },
-        { urls: "stun:stun.cloudflare.com:3478" }
+        { urls: "stun:stun.cloudflare.com:3478" },
+        {
+            urls: "turn:openrelay.metered.ca:80",
+            username: "openrelay",
+            credential: "openrelay"
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443",
+            username: "openrelay",
+            credential: "openrelay"
+        },
+        {
+            urls: "turn:openrelay.metered.ca:443?transport=tcp",
+            username: "openrelay",
+            credential: "openrelay"
+        }
     ],
-    iceCandidatePoolSize: 0
+    iceCandidatePoolSize: 2
 };
 
 // Sub-component to render remote peer video and audio feeds
@@ -99,6 +111,17 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
             t.addEventListener("ended", handleTrackUpdate);
         });
 
+        // Dedicated listener for first incoming video keyframe unmute
+        const vTracks = stream.getVideoTracks();
+        vTracks.forEach((t) => {
+            t.onunmute = () => {
+                if (videoRef.current) {
+                    videoRef.current.play().catch(console.warn);
+                    setHasRemoteVideo(true);
+                }
+            };
+        });
+
         // Periodic check to capture video frames as soon as ICE connection settles
         const intervalId = setInterval(syncStream, 1000);
 
@@ -128,7 +151,7 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
             {/* Dedicated HTML5 audio tag for clear speaker output */}
             <audio ref={audioRef} autoPlay playsInline />
 
-            {/* Video element is ALWAYS mounted and MUTED so browser NEVER blocks autoplay */}
+            {/* Video element is ALWAYS mounted, active in render tree, and MUTED so browser NEVER blocks autoplay */}
             <video 
                 ref={videoRef} 
                 autoPlay 
@@ -150,12 +173,17 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
                         }
                     }
                 }}
-                className={`w-full h-full object-cover ${hasRemoteVideo && stream ? "block" : "hidden"}`}
+                onPlaying={() => {
+                    setHasRemoteVideo(true);
+                }}
+                className={`w-full h-full object-cover transition-opacity duration-300 ${
+                    hasRemoteVideo && stream ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
+                }`}
             />
 
             {/* Avatar placeholder shown when video is inactive, camera is off, or stream is connecting */}
             {(!hasRemoteVideo || !stream) && (
-                <div className="text-center space-y-2">
+                <div className="text-center space-y-2 relative z-0">
                     <div className="w-16 h-16 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-400 font-extrabold text-lg flex items-center justify-center mx-auto">
                         {peer.user?.fullName?.charAt(0).toUpperCase() || "P"}
                     </div>
@@ -177,7 +205,7 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
                 </button>
             )}
 
-            <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md">
+            <div className="absolute bottom-3 left-3 bg-black/60 px-3 py-1 rounded-full text-xs font-medium border border-white/5 flex items-center gap-1.5 backdrop-blur-md z-20">
                 <span className={`w-1.5 h-1.5 rounded-full ${stream ? "bg-emerald-400" : "bg-amber-400"}`}></span>
                 {peer.user?.fullName || "Peer"}
             </div>
@@ -342,9 +370,12 @@ export default function MeetingRoom() {
         }
     };
 
-    // Initialize camera on mount and cleanup on unmount
+    // Initialize camera and pre-connect socket on mount
     useEffect(() => {
         startCamera();
+        if (!socket.connected) {
+            socket.connect();
+        }
         return () => {
             stopCamera();
         };
@@ -421,44 +452,32 @@ export default function MeetingRoom() {
         }
     };
 
-    // Helper: Attach local tracks to a peer connection (reuses transceivers if present)
-    const attachLocalTracks = (pc: RTCPeerConnection) => {
+    // Helper: Attach local tracks to a peer connection (reuses transceivers or adds cleanly)
+    const attachLocalTracks = async (pc: RTCPeerConnection) => {
         if (!localStreamRef.current) return;
 
         const localTracks = localStreamRef.current.getTracks();
-        const transceivers = typeof pc.getTransceivers === "function" ? pc.getTransceivers() : [];
+        const senders = pc.getSenders();
 
-        localTracks.forEach((track) => {
-            // Find existing transceiver matched by receiver/sender track kind
-            const matchedTransceiver = transceivers.find(
-                (t) => (t.receiver && t.receiver.track && t.receiver.track.kind === track.kind) ||
-                       (t.sender && t.sender.track && t.sender.track.kind === track.kind)
-            );
-
-            if (matchedTransceiver && matchedTransceiver.sender) {
-                if (matchedTransceiver.direction === "recvonly") {
-                    matchedTransceiver.direction = "sendrecv";
-                }
-                matchedTransceiver.sender.replaceTrack(track).catch((err) => {
+        for (const track of localTracks) {
+            const sender = senders.find((s) => s.track && s.track.kind === track.kind);
+            if (sender) {
+                try {
+                    await sender.replaceTrack(track);
+                } catch (err) {
                     console.warn(`replaceTrack error for ${track.kind}:`, err);
-                });
+                }
             } else {
-                const senders = pc.getSenders();
-                const matchedSender = senders.find((s) => s.track && s.track.kind === track.kind);
-                if (matchedSender) {
-                    matchedSender.replaceTrack(track).catch(console.warn);
-                } else {
-                    try {
-                        pc.addTrack(track, localStreamRef.current!);
-                    } catch (err) {
-                        console.warn("addTrack warning:", err);
-                    }
+                try {
+                    pc.addTrack(track, localStreamRef.current!);
+                } catch (err) {
+                    console.warn(`addTrack warning for ${track.kind}:`, err);
                 }
             }
-        });
+        }
     };
 
-    // Helper: Create an RTCPeerConnection for a target peer
+    // Helper: Create an RTCPeerConnection for a target peer with pre-attached local tracks
     const createPeerConnection = (targetSocketId: string) => {
         if (peersRef.current.has(targetSocketId)) {
             return peersRef.current.get(targetSocketId)!;
@@ -466,6 +485,17 @@ export default function MeetingRoom() {
 
         const pc = new RTCPeerConnection(ICE_SERVERS);
         peersRef.current.set(targetSocketId, pc);
+
+        // ALWAYS pre-add local tracks immediately so both Offer and Answer have sendrecv audio/video
+        if (localStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((track) => {
+                try {
+                    pc.addTrack(track, localStreamRef.current!);
+                } catch (e) {
+                    console.warn("Error pre-attaching track:", e);
+                }
+            });
+        }
 
         // Send gathered ICE candidate to peer
         pc.onicecandidate = (event) => {
@@ -500,7 +530,7 @@ export default function MeetingRoom() {
         pc.oniceconnectionstatechange = () => {
             console.log(`🧊 ICE State with ${targetSocketId}:`, pc.iceConnectionState);
             if (pc.iceConnectionState === "failed") {
-                console.warn(`ICE failed with ${targetSocketId}, restarting ICE...`);
+                console.warn(`ICE failed with ${targetSocketId}, attempting restart...`);
                 try {
                     pc.restartIce();
                 } catch (e) {
@@ -511,11 +541,14 @@ export default function MeetingRoom() {
 
         pc.onconnectionstatechange = () => {
             console.log(`🔌 Connection state with ${targetSocketId}:`, pc.connectionState);
-            if (
-                pc.connectionState === "disconnected" ||
-                pc.connectionState === "failed" ||
-                pc.connectionState === "closed"
-            ) {
+            if (pc.connectionState === "failed") {
+                console.warn(`Connection state failed with ${targetSocketId}, restarting ICE...`);
+                try {
+                    pc.restartIce();
+                } catch (e) {
+                    console.warn("restartIce error:", e);
+                }
+            } else if (pc.connectionState === "closed") {
                 setRemoteStreams((prev) => {
                     const next = { ...prev };
                     delete next[targetSocketId];
@@ -530,11 +563,23 @@ export default function MeetingRoom() {
     // Helper: Initiate a WebRTC call to an existing peer in the room
     const initiateCallToPeer = async (peerSocketId: string, callerSafeUser: any) => {
         try {
-            const pc = createPeerConnection(peerSocketId);
-            // Attach local tracks before creating offer
-            attachLocalTracks(pc);
+            const existingPc = peersRef.current.get(peerSocketId);
+            if (existingPc && (existingPc.connectionState === "connected" || existingPc.iceConnectionState === "connected")) {
+                console.log(`Peer connection to ${peerSocketId} is already connected, skipping re-initiation.`);
+                return;
+            }
+            if (existingPc) {
+                existingPc.close();
+                peersRef.current.delete(peerSocketId);
+            }
 
-            const offer = await pc.createOffer();
+            const pc = createPeerConnection(peerSocketId);
+            await attachLocalTracks(pc);
+
+            const offer = await pc.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: true
+            });
             await pc.setLocalDescription(offer);
 
             socket.emit("sending-signal", {
@@ -559,16 +604,27 @@ export default function MeetingRoom() {
 
             const pc = createPeerConnection(callerId);
 
-            // 1. Set remote description from incoming offer FIRST so transceivers match the offer
+            // Handle offer collision / glare gracefully using polite-peer rule
+            if (pc.signalingState !== "stable") {
+                const isPolite = (socket.id || "") > callerId;
+                if (!isPolite) {
+                    console.log(`⚠️ Glare detected with ${callerId}, impolite peer ignoring colliding offer.`);
+                    return;
+                }
+                console.log(`⚠️ Glare detected with ${callerId}, polite peer rolling back.`);
+                await pc.setLocalDescription({ type: "rollback" } as any).catch(() => {});
+            }
+
+            // 1. Set remote description from incoming offer
             await pc.setRemoteDescription(new RTCSessionDescription(signal));
 
             // 2. Drain any early ICE candidates
             await drainQueuedCandidates(callerId, pc);
 
-            // 3. Attach local tracks to the negotiated transceivers/senders
-            attachLocalTracks(pc);
+            // 3. Attach local tracks to transceivers/senders and await
+            await attachLocalTracks(pc);
 
-            // 4. Create answer and set local description
+            // 4. Create answer with guaranteed audio and video tracks
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
 
@@ -609,10 +665,10 @@ export default function MeetingRoom() {
                 fullName: "Participant"
             };
 
-            // Initiate WebRTC peer connections with everyone currently in the room
-            for (const peer of usersList) {
-                await initiateCallToPeer(peer.socketId, safeUser);
-            }
+            // Parallel initiation to all peers in room for ultra-fast connection
+            await Promise.allSettled(
+                usersList.map((peer) => initiateCallToPeer(peer.socketId, safeUser))
+            );
         };
 
         const handleUserConnected = ({ socketId, user: joiningUser }: { socketId: string; user: any }) => {
@@ -1296,10 +1352,10 @@ export default function MeetingRoom() {
                                 autoPlay 
                                 playsInline 
                                 muted 
-                                className={`w-full h-full object-cover scale-x-[-1] ${camEnabled && localStream ? "block" : "hidden"}`}
+                                className={`w-full h-full object-cover scale-x-[-1] transition-opacity duration-200 ${camEnabled && localStream ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"}`}
                             />
                             {(!camEnabled || !localStream) && (
-                                <div className="text-center space-y-2">
+                                <div className="text-center space-y-2 relative z-0">
                                     <div className="w-12 h-12 rounded-full bg-white/5 flex items-center justify-center mx-auto text-neutral-400">
                                         <VideoOff className="w-6 h-6" />
                                     </div>
@@ -1443,10 +1499,10 @@ export default function MeetingRoom() {
                                 autoPlay 
                                 playsInline 
                                 muted 
-                                className={`w-full h-full object-cover scale-x-[-1] ${camEnabled && localStream ? "block" : "hidden"}`}
+                                className={`w-full h-full object-cover scale-x-[-1] transition-opacity duration-200 ${camEnabled && localStream ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"}`}
                             />
                             {(!camEnabled || !localStream) && (
-                                <div className="text-center space-y-1">
+                                <div className="text-center space-y-1 relative z-0">
                                     <div className="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center mx-auto text-neutral-500">
                                         <VideoOff className="w-5 h-5" />
                                     </div>

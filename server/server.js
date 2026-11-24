@@ -105,7 +105,7 @@ const startServer = async () => {
             socket.on("sending-signal", ({ userToSignal, signal, callerId, callerUser }) => {
                 io.to(userToSignal).emit("user-joined-signal", {
                     signal,
-                    callerId,
+                    callerId: socket.id,
                     callerUser
                 });
             });
