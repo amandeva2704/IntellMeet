@@ -2,7 +2,7 @@
  * End-to-End Test for WebRTC Signaling & Multi-User Meeting Synchronization
  */
 
-const { io } = require("../client/node_modules/socket.io-client");
+const { io } = require("../../client/node_modules/socket.io-client");
 
 const SERVER_URL = "http://localhost:5000";
 const ROOM_ID = "test-room-" + Date.now();
