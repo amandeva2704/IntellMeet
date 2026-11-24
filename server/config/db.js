@@ -73,34 +73,43 @@ const connectDB = async () => {
         try {
             console.log("⏳ Connecting to MongoDB Atlas...");
             const conn = await mongoose.connect(mongoUri, {
-                serverSelectionTimeoutMS: 3000 // Fast fail if port 27017 or DNS is unreachable
+                serverSelectionTimeoutMS: 10000 // Allow up to 10s for Atlas SRV/DNS & TLS handshake
             });
 
             console.log("==========================================");
             console.log("✅ MongoDB Atlas Connected Successfully!");
             console.log(`🌐 Host: ${conn.connection.host}`);
             console.log(`📁 Database: ${conn.connection.name}`);
+            console.log("🎉 User accounts and meetings are permanently saved in the cloud!");
             console.log("==========================================");
             return;
         } catch (err) {
             console.warn("==========================================");
             console.warn("⚠️ MongoDB Atlas connection timed out or unreachable:");
             console.warn(`   Reason: ${err.message}`);
-            console.warn("💡 Automatically falling back to Local Persistent MongoDB so login/register work smoothly!");
+            console.warn("💡 Falling back to Local Persistent MongoDB...");
             console.warn("==========================================");
         }
     }
 
-    // 3. Fallback to Local Persistent MongoDB so app never fails or buffers
+    // 3. Fallback to Local Persistent MongoDB so app never crashes
     try {
+        const isCloudDeployment = !!(process.env.RENDER || process.env.VERCEL || (process.env.NODE_ENV === "production" && !process.env.USE_LOCAL_MONGO));
         const localUri = await startLocalMongo();
         const conn = await mongoose.connect(localUri, { dbName: "intellmeet" });
         await migrateLegacyData();
         console.log("==========================================");
-        console.log("✅ Connected to Local Persistent MongoDB successfully!");
+        console.log("✅ Connected to Local MongoDB fallback successfully!");
         console.log(`🌐 Host: ${conn.connection.host}`);
         console.log("📁 Data saved in: server/.local_mongo_data");
-        console.log("🎉 User Login, Register, and all APIs will persist across server restarts!");
+        if (isCloudDeployment) {
+            console.warn("⚠️ IMPORTANT NOTE FOR CLOUD HOSTING (e.g. Render):");
+            console.warn("   Render free-tier instances sleep after 15m and wipe ephemeral container files.");
+            console.warn("   To prevent users from having to register again after server sleep,");
+            console.warn("   configure MONGO_URI in your Render service environment variables.");
+        } else {
+            console.log("🎉 User Login, Register, and all APIs will persist across server restarts!");
+        }
         console.log("==========================================");
     } catch (fallbackErr) {
         console.error("❌ All MongoDB connection options failed:", fallbackErr.message);

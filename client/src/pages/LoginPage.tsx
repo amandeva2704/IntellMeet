@@ -10,10 +10,21 @@ export default function LoginPage() {
     const [searchParams] = useSearchParams();
     const redirectUrl = searchParams.get("redirect") || "/dashboard";
 
+    const [isSlow, setIsSlow] = useState(false);
     const [formData, setFormData] = useState({
         email: "",
         password: ""
     });
+
+    React.useEffect(() => {
+        let timer: any;
+        if (authLoading) {
+            timer = setTimeout(() => setIsSlow(true), 3000);
+        } else {
+            setIsSlow(false);
+        }
+        return () => clearTimeout(timer);
+    }, [authLoading]);
 
     const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         setFormData({ ...formData, [e.target.name]: e.target.value });
@@ -105,6 +116,12 @@ export default function LoginPage() {
                             </>
                         )}
                     </button>
+
+                    {isSlow && (
+                        <p className="text-xs text-amber-400/90 text-center animate-pulse pt-2">
+                            Connecting to cloud server... this may take up to 30 seconds if the free server is waking up.
+                        </p>
+                    )}
                 </form>
 
                 <div className="mt-8 text-center text-sm text-neutral-400">
