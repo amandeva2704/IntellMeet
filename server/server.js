@@ -37,6 +37,7 @@ const startServer = async () => {
                 credentials: true
             }
         });
+        app.set("io", io);
 
         // Socket.io connection logic
         io.on("connection", (socket) => {
@@ -155,7 +156,47 @@ const startServer = async () => {
                 socket.broadcast.emit("refresh-kanban-board", { workspaceId });
             });
 
-            // 6. Handle Disconnection
+            // 6. Explicit Leave Room
+            socket.on("leave-room", ({ roomId, user }) => {
+                const cleanRoomId = normalizeRoomId(roomId);
+                const safeUser = user || { _id: socket.id, fullName: "A participant" };
+                console.log(`👋 User "${safeUser.fullName}" explicitly left room: ${cleanRoomId}`);
+
+                socket.leave(cleanRoomId);
+                activeConnections.delete(socket.id);
+
+                socket.to(cleanRoomId).emit("user-disconnected", {
+                    socketId: socket.id,
+                    userId: safeUser._id || socket.id,
+                    name: safeUser.fullName || "A participant"
+                });
+            });
+
+            // 7. Host Ends Meeting for All Participants
+            socket.on("end-meeting", ({ roomId, userId }) => {
+                const cleanRoomId = normalizeRoomId(roomId);
+                console.log(`🛑 Meeting ended in room "${cleanRoomId}" by user "${userId}"`);
+
+                // Broadcast termination event to all clients in the room
+                io.to(cleanRoomId).emit("meeting-ended", {
+                    roomId: cleanRoomId,
+                    message: "The host has ended this meeting."
+                });
+
+                // Clear room sockets and active tracking
+                const clientsInRoom = io.sockets.adapter.rooms.get(cleanRoomId);
+                if (clientsInRoom) {
+                    for (const clientId of Array.from(clientsInRoom)) {
+                        const clientSocket = io.sockets.sockets.get(clientId);
+                        if (clientSocket) {
+                            clientSocket.leave(cleanRoomId);
+                        }
+                        activeConnections.delete(clientId);
+                    }
+                }
+            });
+
+            // 8. Handle Disconnection
             socket.on("disconnect", () => {
                 console.log(`🔌 Socket disconnected: ${socket.id}`);
                 const connectionData = activeConnections.get(socket.id);

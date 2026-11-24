@@ -93,9 +93,14 @@ exports.joinMeeting = async (req, res) => {
             });
         }
 
-        // If meeting was previously completed, reactivate it so participants can rejoin
+        // If meeting was previously completed, return completion status without reactivating
         if (meeting.status === "completed") {
-            meeting.status = "active";
+            return res.status(200).json({
+                success: true,
+                isCompleted: true,
+                message: "This meeting has already ended",
+                meeting
+            });
         }
 
         // Add user to participants if not already added
@@ -278,16 +283,50 @@ exports.endMeeting = async (req, res) => {
         }
 
         if (meeting.status === "completed") {
-            return res.status(400).json({
-                success: false,
-                message: "Meeting has already been ended"
+            return res.status(200).json({
+                success: true,
+                message: "Meeting has already been ended",
+                meeting
             });
+        }
+
+        // Merge any final in-memory transcripts, chats, and notes sent from client
+        const { finalTranscripts, finalChats, notes } = req.body || {};
+
+        if (notes && typeof notes === "string") {
+            meeting.notes = notes;
+        }
+
+        if (Array.isArray(finalTranscripts) && finalTranscripts.length > 0) {
+            if (!meeting.transcript) meeting.transcript = [];
+            for (const ft of finalTranscripts) {
+                if (ft.text && !meeting.transcript.some(t => t.sender === ft.sender && t.text === ft.text)) {
+                    meeting.transcript.push({
+                        sender: ft.sender || "Speaker",
+                        text: ft.text,
+                        timestamp: ft.timestamp ? new Date(ft.timestamp) : new Date()
+                    });
+                }
+            }
+        }
+
+        if (Array.isArray(finalChats) && finalChats.length > 0) {
+            if (!meeting.chats) meeting.chats = [];
+            for (const fc of finalChats) {
+                if (fc.text && !meeting.chats.some(c => c.sender === fc.sender && c.text === fc.text)) {
+                    meeting.chats.push({
+                        sender: fc.sender || "Participant",
+                        text: fc.text,
+                        timestamp: fc.timestamp ? new Date(fc.timestamp) : new Date()
+                    });
+                }
+            }
         }
 
         meeting.status = "completed";
         meeting.endTime = new Date();
 
-        // Process AI intelligence (combine spoken voice transcripts, plus chats)
+        // Process AI intelligence (combine spoken voice transcripts, plus chats & notes)
         let conversationText = (meeting.transcript || [])
             .map(t => `${t.sender} (Voice): ${t.text}`)
             .join("\n");
@@ -301,9 +340,13 @@ exports.endMeeting = async (req, res) => {
                 : `[Meeting Room Chats]:\n${chatLog}`;
         }
 
+        if (meeting.notes && meeting.notes.trim()) {
+            conversationText = `${conversationText}\n\n[Meeting Notes]:\n${meeting.notes.trim()}`;
+        }
+
         const aiResult = await aiService.generateSummaryAndActionItems(conversationText, meeting.title);
         meeting.summary = aiResult.summary;
-        meeting.actionItems = aiResult.actionItems.map(item => ({
+        meeting.actionItems = (aiResult.actionItems || []).map(item => ({
             title: item.title,
             assigneeName: item.assigneeName || "",
             status: "pending"
@@ -311,10 +354,59 @@ exports.endMeeting = async (req, res) => {
 
         await meeting.save();
 
+        // Broadcast meeting-ended notification to all connected participants via socket.io
+        try {
+            const io = req.app.get("io");
+            if (io) {
+                const cleanRoomId = normalizeRoomId(roomId);
+                io.to(cleanRoomId).emit("meeting-ended", {
+                    roomId: cleanRoomId,
+                    message: "The host has ended this meeting."
+                });
+            }
+        } catch (sockErr) {
+            console.warn("Socket broadcast error on meeting end:", sockErr.message);
+        }
+
         res.status(200).json({
             success: true,
             message: "Meeting ended and AI analysis completed",
             meeting
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            message: err.message
+        });
+    }
+};
+
+exports.leaveMeeting = async (req, res) => {
+    try {
+        const { roomId } = req.params;
+        const meeting = await findMeetingByRoomId(roomId);
+
+        if (!meeting) {
+            return res.status(404).json({
+                success: false,
+                message: "Meeting not found"
+            });
+        }
+
+        // Record leftAt timestamp for the leaving user
+        if (req.user) {
+            const participant = meeting.participants.find(
+                p => p.user && p.user.toString() === req.user._id.toString()
+            );
+            if (participant) {
+                participant.leftAt = new Date();
+                await meeting.save();
+            }
+        }
+
+        res.status(200).json({
+            success: true,
+            message: "Left meeting successfully"
         });
     } catch (err) {
         res.status(500).json({

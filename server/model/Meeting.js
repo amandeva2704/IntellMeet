@@ -28,6 +28,9 @@ const meetingSchema = new mongoose.Schema(
             joinedAt: {
                 type: Date,
                 default: Date.now
+            },
+            leftAt: {
+                type: Date
             }
         }
     ],
@@ -84,6 +87,10 @@ const meetingSchema = new mongoose.Schema(
         }
     ],
     summary: {
+        type: String,
+        default: ""
+    },
+    notes: {
         type: String,
         default: ""
     },

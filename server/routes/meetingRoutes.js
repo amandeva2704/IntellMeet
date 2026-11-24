@@ -11,6 +11,7 @@ router.put("/:roomId/transcript", protect, meetingControllers.updateMeetingTrans
 router.post("/:roomId/transcript", protect, meetingControllers.updateMeetingTranscript);
 router.post("/:roomId/chat", protect, meetingControllers.addMeetingChat);
 router.put("/:roomId/chat", protect, meetingControllers.addMeetingChat);
+router.post("/:roomId/leave", protect, meetingControllers.leaveMeeting);
 router.post("/:roomId/end", protect, meetingControllers.endMeeting);
 
 module.exports = router;

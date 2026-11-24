@@ -187,14 +187,27 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
 export default function MeetingRoom() {
     const { roomId } = useParams<{ roomId: string }>();
     const navigate = useNavigate();
-    const { user, activeMeeting, joinMeeting, endMeeting, addTranscriptMessage, addChatMessage } = useStore();
+    const { user, activeMeeting, joinMeeting, endMeeting, leaveMeeting, addTranscriptMessage, addChatMessage } = useStore();
 
     // UI States
     const [inLobby, setInLobby] = useState(true);
     const [micEnabled, setMicEnabled] = useState(true);
     const [camEnabled, setCamEnabled] = useState(true);
     const [screenSharing, setScreenSharing] = useState(false);
+    const [isEnding, setIsEnding] = useState(false);
     const [activeTab, setActiveTab] = useState<"chat" | "transcript" | "notes" | "participants">("chat");
+
+    // Determine whether current user is the host
+    const isHost = Boolean(
+        activeMeeting && user && (
+            (typeof activeMeeting.host === "string" && (activeMeeting.host === user._id || activeMeeting.host === (user as any).id)) ||
+            (typeof activeMeeting.host === "object" && (
+                activeMeeting.host?._id === user._id || 
+                (activeMeeting.host as any)?._id === (user as any).id || 
+                (activeMeeting.host as any)?.toString() === user._id
+            ))
+        )
+    );
 
     // Chat and note states (text chats saved separately)
     const [messages, setMessages] = useState<ChatItem[]>([]);
@@ -223,6 +236,7 @@ export default function MeetingRoom() {
     const iceCandidatesQueue = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
     const [peers, setPeers] = useState<{ socketId: string; user: any }[]>([]);
     const [remoteStreams, setRemoteStreams] = useState<{ [socketId: string]: MediaStream }>({});
+    const cleanupMeetingRef = useRef<() => void>(() => {});
 
     // Keep state refs in sync
     useEffect(() => {
@@ -311,7 +325,10 @@ export default function MeetingRoom() {
 
     const stopCamera = () => {
         if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach((track) => track.stop());
+            localStreamRef.current.getTracks().forEach((track) => {
+                track.stop();
+                track.enabled = false;
+            });
             localStreamRef.current = null;
             setLocalStream(null);
         }
@@ -355,12 +372,17 @@ export default function MeetingRoom() {
         }
     }, [localStream, inLobby, camEnabled]);
 
-    // 2. Fetch Meeting details on load (pre-populates chats and voice transcripts)
+    // 2. Fetch Meeting details on load (pre-populates chats, voice transcripts, or redirects if ended)
     useEffect(() => {
         if (roomId) {
             const cleanId = normalizeRoomId(roomId);
-            joinMeeting(cleanId).then((m) => {
+            joinMeeting(cleanId).then((m: any) => {
                 if (m) {
+                    if (m.status === "completed" || m.isCompleted) {
+                        toast("This meeting has already ended. Loading summary...", { icon: "🏁" });
+                        navigate(`/meeting/${cleanId}/summary`, { replace: true });
+                        return;
+                    }
                     if (m.chats && m.chats.length > 0) {
                         setMessages(m.chats);
                     }
@@ -375,7 +397,7 @@ export default function MeetingRoom() {
                 const currentActive = useStore.getState().activeMeeting;
                 if (!currentActive || normalizeRoomId(currentActive.roomId) !== cleanId) {
                     toast.error(err.message || "Meeting room not found");
-                    navigate("/dashboard");
+                    navigate("/dashboard", { replace: true });
                 }
             });
         }
@@ -676,6 +698,14 @@ export default function MeetingRoom() {
             }
         };
 
+        // Host Meeting Termination handler for participants
+        const handleMeetingEnded = ({ roomId: endedRoomId }: any) => {
+            console.log("🛑 Host ended the meeting:", endedRoomId);
+            toast("The host has ended this meeting for everyone. Loading AI summary...", { icon: "🏁", duration: 5000 });
+            cleanupMeetingRef.current();
+            navigate(`/meeting/${endedRoomId || roomId}/summary`, { replace: true });
+        };
+
         socket.on("all-users", handleAllUsers);
         socket.on("user-connected", handleUserConnected);
         socket.on("user-joined-signal", handleUserJoinedSignal);
@@ -685,6 +715,7 @@ export default function MeetingRoom() {
         socket.on("receive-message", handleReceiveMessage);
         socket.on("receive-transcript", handleReceiveTranscript);
         socket.on("user-typing", handleUserTyping);
+        socket.on("meeting-ended", handleMeetingEnded);
         socket.on("connect", handleSocketConnect);
 
         return () => {
@@ -697,6 +728,7 @@ export default function MeetingRoom() {
             socket.off("receive-message", handleReceiveMessage);
             socket.off("receive-transcript", handleReceiveTranscript);
             socket.off("user-typing", handleUserTyping);
+            socket.off("meeting-ended", handleMeetingEnded);
             socket.off("connect", handleSocketConnect);
         };
     }, [roomId, user]);
@@ -1054,36 +1086,138 @@ export default function MeetingRoom() {
         toast.success("Voice transcript saved under your name", { icon: "🎙️" });
     };
 
-    // 8. End or Leave Meeting
-    const handleLeaveMeeting = () => {
-        socket.disconnect();
+    // Helper: Completely teardown all meeting streams, peers, speech recognition, and sockets
+    const cleanupMeetingState = () => {
+        isInMeetingRef.current = false;
         stopCamera();
         stopSpeechRecognition();
-        peersRef.current.forEach((pc) => pc.close());
+        peersRef.current.forEach((pc) => {
+            try {
+                pc.close();
+            } catch (e) {}
+        });
         peersRef.current.clear();
         iceCandidatesQueue.current.clear();
-        toast.success("You left the meeting room");
-        navigate("/dashboard");
-    };
-
-    const handleEndMeeting = async () => {
-        if (!roomId) return;
-        const confirm = window.confirm("Are you sure you want to end the meeting for everyone? This triggers AI summary analysis.");
-        if (!confirm) return;
-
-        try {
-            stopCamera();
-            stopSpeechRecognition();
-            peersRef.current.forEach((pc) => pc.close());
-            peersRef.current.clear();
-            iceCandidatesQueue.current.clear();
-            await endMeeting(roomId);
-            toast.success("Meeting ended! AI analysis ready.");
-            navigate(`/meeting/${roomId}/summary`);
-        } catch (err: any) {
-            toast.error(err.message || "Failed to end meeting");
+        setRemoteStreams({});
+        setPeers([]);
+        if (socket.connected) {
+            socket.disconnect();
         }
     };
+    cleanupMeetingRef.current = cleanupMeetingState;
+
+    // 8. End or Leave Meeting Action
+    const handleEndOrLeaveMeeting = async () => {
+        if (!roomId || isEnding) return;
+        const cleanRoomId = normalizeRoomId(roomId);
+
+        if (isHost) {
+            // HOST: Ends meeting for all participants & generates AI summary
+            const confirmEnd = window.confirm(
+                "Are you sure you want to end the meeting for everyone? This will save all chats, voice transcripts, and generate the AI summary."
+            );
+            if (!confirmEnd) return;
+
+            setIsEnding(true);
+            try {
+                // 1. Notify all connected participants via Socket.IO immediately
+                socket.emit("end-meeting", { roomId: cleanRoomId, userId: user?._id });
+
+                // 2. Persist AI summary, final transcripts, chats & notes to database
+                await endMeeting(cleanRoomId, {
+                    finalTranscripts: transcripts,
+                    finalChats: messages,
+                    notes: meetingNotes
+                });
+
+                // 3. Clean up hardware and WebRTC peer connections
+                cleanupMeetingState();
+
+                toast.success("Meeting ended! AI analysis ready.");
+                navigate(`/meeting/${cleanRoomId}/summary`, { replace: true });
+            } catch (err: any) {
+                console.error("Failed to end meeting:", err);
+                toast.error(err.message || "Failed to end meeting");
+                setIsEnding(false);
+            }
+        } else {
+            // PARTICIPANT: Leaves meeting room only, meeting continues for everyone else
+            const confirmLeave = window.confirm("Are you sure you want to leave this meeting?");
+            if (!confirmLeave) return;
+
+            try {
+                // 1. Notify room that participant left
+                const safeUser = user || { _id: "user_" + Date.now(), fullName: "Participant" };
+                socket.emit("leave-room", { roomId: cleanRoomId, user: safeUser });
+
+                // 2. Update participant leftAt in database
+                await leaveMeeting(cleanRoomId);
+
+                // 3. Clean up hardware and WebRTC connections immediately
+                cleanupMeetingState();
+
+                toast.success("You left the meeting");
+                navigate("/dashboard", { replace: true });
+            } catch (err: any) {
+                cleanupMeetingState();
+                navigate("/dashboard", { replace: true });
+            }
+        }
+    };
+
+    // Host can also leave without terminating the meeting for others
+    const handleHostLeaveWithoutEnding = async () => {
+        if (!roomId || isEnding) return;
+        const cleanRoomId = normalizeRoomId(roomId);
+        const confirmLeave = window.confirm(
+            "Leave the room without ending the meeting? Other participants will remain connected."
+        );
+        if (!confirmLeave) return;
+
+        try {
+            const safeUser = user || { _id: "user_" + Date.now(), fullName: "Host" };
+            socket.emit("leave-room", { roomId: cleanRoomId, user: safeUser });
+            await leaveMeeting(cleanRoomId);
+            cleanupMeetingState();
+            toast.success("You left the meeting room");
+            navigate("/dashboard", { replace: true });
+        } catch (err: any) {
+            cleanupMeetingState();
+            navigate("/dashboard", { replace: true });
+        }
+    };
+
+    // 9. Handle unexpected disconnections and browser closures
+    useEffect(() => {
+        const handleBeforeUnload = () => {
+            if (isInMeetingRef.current && roomId) {
+                const cleanRoomId = normalizeRoomId(roomId);
+                const safeUser = user || { _id: "user_" + Date.now(), fullName: "Participant" };
+                if (socket.connected) {
+                    socket.emit("leave-room", { roomId: cleanRoomId, user: safeUser });
+                }
+            }
+            if (localStreamRef.current) {
+                localStreamRef.current.getTracks().forEach((track) => {
+                    track.stop();
+                    track.enabled = false;
+                });
+            }
+            peersRef.current.forEach((pc) => {
+                try {
+                    pc.close();
+                } catch (e) {}
+            });
+        };
+
+        window.addEventListener("beforeunload", handleBeforeUnload);
+        window.addEventListener("pagehide", handleBeforeUnload);
+
+        return () => {
+            window.removeEventListener("beforeunload", handleBeforeUnload);
+            window.removeEventListener("pagehide", handleBeforeUnload);
+        };
+    }, [roomId, user]);
 
     // Render Lobby Frame
     if (inLobby) {
@@ -1508,7 +1642,9 @@ export default function MeetingRoom() {
                                         </div>
                                         <span className="font-semibold text-white">{user?.fullName || "You"} (You)</span>
                                     </div>
-                                    <span className="text-[10px] text-violet-400 font-bold bg-violet-500/10 px-2 py-0.5 rounded">Host</span>
+                                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${isHost ? "text-violet-400 bg-violet-500/10" : "text-neutral-400 bg-white/5"}`}>
+                                        {isHost ? "Host" : "Participant"}
+                                    </span>
                                 </div>
 
                                 {/* Remotes */}
@@ -1592,17 +1728,29 @@ export default function MeetingRoom() {
 
                 {/* 3. Leave and End meeting actions */}
                 <div className="flex items-center gap-3">
+                    {isHost && (
+                        <button
+                            type="button"
+                            onClick={handleHostLeaveWithoutEnding}
+                            disabled={isEnding}
+                            className="flex items-center gap-1.5 text-xs border border-white/10 hover:bg-white/5 text-neutral-300 px-3.5 py-2.5 rounded-xl font-semibold transition-all cursor-pointer disabled:opacity-50"
+                            title="Leave meeting without ending it for other participants"
+                        >
+                            <LogOut className="w-3.5 h-3.5" /> Leave Room
+                        </button>
+                    )}
                     <button
-                        onClick={handleLeaveMeeting}
-                        className="flex items-center gap-1.5 text-xs border border-white/10 hover:bg-white/5 text-neutral-300 px-4 py-2 rounded-xl font-semibold transition-all cursor-pointer"
+                        type="button"
+                        onClick={handleEndOrLeaveMeeting}
+                        disabled={isEnding}
+                        className="flex items-center gap-2 text-xs bg-red-600 hover:bg-red-500 text-white px-4 py-2.5 rounded-xl font-bold shadow-lg shadow-red-500/20 transition-all cursor-pointer disabled:opacity-50"
+                        title={isHost ? "End meeting for all participants and generate AI Summary" : "Leave this meeting room"}
                     >
-                        <LogOut className="w-3.5 h-3.5" /> Leave Lobby
-                    </button>
-                    <button
-                        onClick={handleEndMeeting}
-                        className="flex items-center gap-1.5 text-xs bg-red-600 hover:bg-red-500 text-white px-4 py-2 rounded-xl font-bold shadow shadow-red-500/20 transition-all cursor-pointer"
-                    >
-                        End Call (AI Summary)
+                        <LogOut className="w-4 h-4" />
+                        {isEnding 
+                            ? "Ending Meeting..." 
+                            : (isHost ? "End AI Summary / Leave (All)" : "End AI Summary / Leave")
+                        }
                     </button>
                 </div>
             </footer>

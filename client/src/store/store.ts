@@ -108,7 +108,8 @@ interface AppState {
     joinMeeting: (roomId: string) => Promise<Meeting>;
     getMeetingDetails: (roomId: string) => Promise<Meeting>;
     updateMeetingDetails: (meeting: Meeting) => void;
-    endMeeting: (roomId: string) => Promise<Meeting>;
+    endMeeting: (roomId: string, payload?: { finalTranscripts?: any[]; finalChats?: any[]; notes?: string }) => Promise<Meeting>;
+    leaveMeeting: (roomId: string) => Promise<void>;
     addTranscriptMessage: (roomId: string, sender: string, text: string) => Promise<void>;
     addChatMessage: (roomId: string, sender: string, text: string) => Promise<void>;
 
@@ -310,9 +311,9 @@ export const useStore = create<AppState>((set, get) => ({
         set({ activeMeeting: meeting });
     },
 
-    endMeeting: async (roomId) => {
+    endMeeting: async (roomId, payload) => {
         try {
-            const res = await api.post(`/meetings/${roomId}/end`);
+            const res = await api.post(`/meetings/${roomId}/end`, payload || {});
             const meeting = res.data.meeting;
             set((state) => ({
                 meetings: state.meetings.map((m) => (m.roomId === roomId ? meeting : m)),
@@ -321,6 +322,14 @@ export const useStore = create<AppState>((set, get) => ({
             return meeting;
         } catch (err: any) {
             throw new Error(err.response?.data?.message || "Failed to end meeting");
+        }
+    },
+
+    leaveMeeting: async (roomId) => {
+        try {
+            await api.post(`/meetings/${roomId}/leave`);
+        } catch (err) {
+            console.warn("Leave meeting request notice:", err);
         }
     },
 
