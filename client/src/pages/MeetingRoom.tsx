@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
 import { useStore } from "../store/store";
 import type { TranscriptItem, ChatItem } from "../store/store";
 import { socket } from "../services/socket";
+import api from "../services/api";
 import { 
     Mic, MicOff, Video as VideoIcon, VideoOff, 
     Monitor, MessageSquare, ListTodo, Users, 
@@ -222,6 +223,7 @@ export default function MeetingRoom() {
     const [liveCaptionText, setLiveCaptionText] = useState("AI Voice Assistant: Listening to conversation...");
     const [isTranscribing, setIsTranscribing] = useState(false);
     const recognitionRef = useRef<any>(null);
+    const audioRecorderRef = useRef<MediaRecorder | null>(null);
     const isInMeetingRef = useRef<boolean>(false);
     const micEnabledRef = useRef<boolean>(true);
 
@@ -888,15 +890,72 @@ export default function MeetingRoom() {
         setIsTranscribing(false);
     };
 
-    // Auto-activate or stop speech recognition based on microphone status
+    // Continuous Whisper audio capture via MediaRecorder (chunked audio slices)
+    const startWhisperAudioCapture = () => {
+        if (!localStreamRef.current) return;
+        const audioTracks = localStreamRef.current.getAudioTracks();
+        if (audioTracks.length === 0) return;
+
+        try {
+            if (audioRecorderRef.current && audioRecorderRef.current.state !== "inactive") {
+                audioRecorderRef.current.stop();
+            }
+
+            const audioStream = new MediaStream(audioTracks);
+            const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") 
+                ? "audio/webm;codecs=opus" 
+                : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
+
+            const options = mimeType ? { mimeType } : undefined;
+            const recorder = new MediaRecorder(audioStream, options);
+
+            recorder.ondataavailable = async (e: BlobEvent) => {
+                if (e.data && e.data.size > 2000 && micEnabledRef.current && roomId) {
+                    try {
+                        const formData = new FormData();
+                        formData.append("audio", e.data, `voice_${user?._id || "user"}_${Date.now()}.webm`);
+                        formData.append("sender", user?.fullName || "Speaker");
+                        if (user?._id) formData.append("senderUser", user._id);
+
+                        await api.post(`/meetings/${roomId}/whisper-transcribe`, formData, {
+                            headers: { "Content-Type": "multipart/form-data" }
+                        });
+                    } catch (err: any) {
+                        // Silent catch on network / chunk processing
+                    }
+                }
+            };
+
+            // Stream continuous audio chunks in 5000ms slices
+            recorder.start(5000);
+            audioRecorderRef.current = recorder;
+            console.log("🎙️ Whisper continuous audio capture active (5s slices)");
+        } catch (e) {
+            console.warn("Could not start MediaRecorder for Whisper:", e);
+        }
+    };
+
+    const stopWhisperAudioCapture = () => {
+        if (audioRecorderRef.current && audioRecorderRef.current.state !== "inactive") {
+            try {
+                audioRecorderRef.current.stop();
+            } catch (e) {}
+            audioRecorderRef.current = null;
+        }
+    };
+
+    // Auto-activate or stop speech recognition & Whisper based on microphone status
     useEffect(() => {
         if (!inLobby && micEnabled) {
             startSpeechRecognition();
+            startWhisperAudioCapture();
         } else {
             stopSpeechRecognition();
+            stopWhisperAudioCapture();
         }
         return () => {
             stopSpeechRecognition();
+            stopWhisperAudioCapture();
         };
     }, [inLobby, micEnabled]);
 
@@ -1091,6 +1150,7 @@ export default function MeetingRoom() {
         isInMeetingRef.current = false;
         stopCamera();
         stopSpeechRecognition();
+        stopWhisperAudioCapture();
         peersRef.current.forEach((pc) => {
             try {
                 pc.close();

@@ -41,9 +41,13 @@ export interface ChatItem {
     timestamp: string;
 }
 
+export type WorkspaceMember = User;
+
 export interface ActionItem {
     _id: string;
     title: string;
+    description?: string;
+    priority?: "low" | "medium" | "high";
     assigneeName?: string;
     status: "pending" | "created";
 }
@@ -53,6 +57,7 @@ export interface Meeting {
     roomId: string;
     title: string;
     host: User | string;
+    workspaceId?: any;
     participants: Participant[];
     status: "active" | "completed";
     startTime: string;
@@ -103,8 +108,8 @@ interface AppState {
     meetings: Meeting[];
     activeMeeting: Meeting | null;
     meetingsLoading: boolean;
-    fetchMeetings: () => Promise<void>;
-    createMeeting: (title: string) => Promise<Meeting>;
+    fetchMeetings: (workspaceId?: string) => Promise<void>;
+    createMeeting: (title: string, workspaceId?: string) => Promise<Meeting>;
     joinMeeting: (roomId: string) => Promise<Meeting>;
     getMeetingDetails: (roomId: string) => Promise<Meeting>;
     updateMeetingDetails: (meeting: Meeting) => void;
@@ -122,6 +127,31 @@ interface AppState {
     updateTaskDetails: (taskId: string, details: any) => Promise<Task>;
     deleteTask: (taskId: string) => Promise<void>;
     createTasksFromActionItems: (meetingId: string, workspaceId: string, actionItems: any[]) => Promise<void>;
+
+    // Analytics Slice
+    analyticsData: AnalyticsMetrics | null;
+    analyticsLoading: boolean;
+    fetchAnalytics: (workspaceId?: string) => Promise<void>;
+}
+
+export interface AnalyticsMetrics {
+    totalMeetings: number;
+    completedMeetings: number;
+    avgDurationMinutes: number;
+    totalTasks: number;
+    todoTasks: number;
+    inProgressTasks: number;
+    completedTasks: number;
+    taskCompletionRate: number;
+    totalActionItems: number;
+    convertedActionItems: number;
+    actionConversionRate: number;
+    totalTranscripts: number;
+    meetingsWithTranscripts: number;
+    engagementRate: number;
+    aiCollaborationScore: number;
+    dailyVolume: { _id: string; count: number }[];
+    recentMeetings: any[];
 }
 
 export const useStore = create<AppState>((set, get) => ({
@@ -213,9 +243,20 @@ export const useStore = create<AppState>((set, get) => ({
             const workspaces = res.data.workspaces;
             set({ workspaces, workspacesLoading: false });
             
-            // Auto select first workspace if none active
-            if (workspaces.length > 0 && !get().activeWorkspace) {
+            const savedWsId = localStorage.getItem("activeWorkspaceId");
+            const currentWs = get().activeWorkspace;
+
+            if (savedWsId) {
+                const matched = workspaces.find((w: any) => w._id === savedWsId);
+                if (matched) {
+                    set({ activeWorkspace: matched });
+                    return;
+                }
+            }
+
+            if (workspaces.length > 0 && !currentWs) {
                 set({ activeWorkspace: workspaces[0] });
+                localStorage.setItem("activeWorkspaceId", workspaces[0]._id);
             }
         } catch (err) {
             set({ workspacesLoading: false });
@@ -228,8 +269,9 @@ export const useStore = create<AppState>((set, get) => ({
             const workspace = res.data.workspace;
             set((state) => ({
                 workspaces: [workspace, ...state.workspaces],
-                activeWorkspace: state.activeWorkspace || workspace
+                activeWorkspace: workspace
             }));
+            localStorage.setItem("activeWorkspaceId", workspace._id);
             return workspace;
         } catch (err: any) {
             throw new Error(err.response?.data?.message || "Failed to create workspace");
@@ -237,6 +279,11 @@ export const useStore = create<AppState>((set, get) => ({
     },
 
     selectWorkspace: (workspace) => {
+        if (workspace) {
+            localStorage.setItem("activeWorkspaceId", workspace._id);
+        } else {
+            localStorage.removeItem("activeWorkspaceId");
+        }
         set({ activeWorkspace: workspace });
     },
 
@@ -261,19 +308,21 @@ export const useStore = create<AppState>((set, get) => ({
     activeMeeting: null,
     meetingsLoading: false,
 
-    fetchMeetings: async () => {
+    fetchMeetings: async (workspaceId) => {
         set({ meetingsLoading: true });
         try {
-            const res = await api.get("/meetings/history");
+            const query = workspaceId ? `?workspaceId=${workspaceId}` : "";
+            const res = await api.get(`/meetings/history${query}`);
             set({ meetings: res.data.meetings, meetingsLoading: false });
         } catch (err) {
             set({ meetingsLoading: false });
         }
     },
 
-    createMeeting: async (title) => {
+    createMeeting: async (title, workspaceId) => {
         try {
-            const res = await api.post("/meetings", { title });
+            const targetWorkspaceId = workspaceId || get().activeWorkspace?._id;
+            const res = await api.post("/meetings", { title, workspaceId: targetWorkspaceId });
             const meeting = res.data.meeting;
             set((state) => ({
                 meetings: [meeting, ...state.meetings],
@@ -458,6 +507,23 @@ export const useStore = create<AppState>((set, get) => ({
             await get().fetchTasks(workspaceId);
         } catch (err: any) {
             throw new Error(err.response?.data?.message || "Failed to import tasks");
+        }
+    },
+
+    // Analytics Implementation
+    analyticsData: null,
+    analyticsLoading: false,
+    fetchAnalytics: async (workspaceId) => {
+        set({ analyticsLoading: true });
+        try {
+            const url = workspaceId && workspaceId !== "all" 
+                ? `/analytics/workspace/${workspaceId}` 
+                : "/analytics";
+            const res = await api.get(url);
+            set({ analyticsData: res.data.metrics, analyticsLoading: false });
+        } catch (err) {
+            console.error("Failed to fetch analytics:", err);
+            set({ analyticsLoading: false });
         }
     }
 }));

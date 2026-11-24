@@ -5,5 +5,9 @@ const SOCKET_URL = rawUrl.replace(/\/api\/?$/, "").replace(/\/+$/, "");
 
 export const socket: Socket = io(SOCKET_URL, {
     autoConnect: false,
-    withCredentials: true
+    withCredentials: true,
+    auth: (cb) => {
+        const token = localStorage.getItem("token");
+        cb({ token });
+    }
 });

@@ -127,6 +127,14 @@ export default function App() {
                     } 
                 />
                 <Route 
+                    path="/project-board" 
+                    element={
+                        <ProtectedRoute>
+                            <ProjectBoard />
+                        </ProtectedRoute>
+                    } 
+                />
+                <Route 
                     path="/analytics" 
                     element={
                         <ProtectedRoute>

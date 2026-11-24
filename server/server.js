@@ -6,6 +6,10 @@ const app = require("./app");
 const connectDB = require("./config/db");
 const { findMeetingByRoomId } = require("./controllers/meetingControllers");
 
+const jwt = require("jsonwebtoken");
+const User = require("./model/User");
+const Workspace = require("./model/Workspace");
+
 const PORT = process.env.PORT || 5000;
 
 // Helper to normalize room IDs across all clients
@@ -38,6 +42,24 @@ const startServer = async () => {
             }
         });
         app.set("io", io);
+
+        // Socket.io JWT authentication middleware
+        io.use(async (socket, next) => {
+            const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace("Bearer ", "");
+            if (!token) {
+                return next();
+            }
+            try {
+                const decoded = jwt.verify(token, process.env.JWT_SECRET);
+                const user = await User.findById(decoded.id).select("-password");
+                if (user) {
+                    socket.user = user;
+                }
+                next();
+            } catch (err) {
+                next();
+            }
+        });
 
         // Socket.io connection logic
         io.on("connection", (socket) => {
@@ -152,8 +174,39 @@ const startServer = async () => {
             });
 
             // 5. Kanban / Workspace Board Sync
+            socket.on("join-workspace", async ({ workspaceId }) => {
+                if (!workspaceId) return;
+                try {
+                    // Check workspace authorization if socket.user is authenticated
+                    if (socket.user) {
+                        const ws = await Workspace.findById(workspaceId);
+                        if (ws) {
+                            const isMember = ws.owner.toString() === socket.user._id.toString() ||
+                                (ws.members && ws.members.some(m => m.toString() === socket.user._id.toString()));
+                            if (!isMember) {
+                                socket.emit("workspace-error", { message: "Unauthorized to join this workspace room" });
+                                return;
+                            }
+                        }
+                    }
+                    socket.join(`workspace-${workspaceId}`);
+                    console.log(`📌 Socket ${socket.id} (user: ${socket.user?.fullName || "guest"}) joined authorized workspace: workspace-${workspaceId}`);
+                } catch (e) {
+                    console.warn("join-workspace error:", e.message);
+                }
+            });
+
+            socket.on("leave-workspace", ({ workspaceId }) => {
+                if (workspaceId) {
+                    socket.leave(`workspace-${workspaceId}`);
+                }
+            });
+
             socket.on("kanban-task-change", ({ workspaceId }) => {
-                socket.broadcast.emit("refresh-kanban-board", { workspaceId });
+                if (workspaceId) {
+                    io.to(`workspace-${workspaceId}`).emit("refresh-kanban-board", { workspaceId });
+                    socket.broadcast.emit("refresh-kanban-board", { workspaceId });
+                }
             });
 
             // 6. Explicit Leave Room

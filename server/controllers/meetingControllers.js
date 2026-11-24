@@ -1,4 +1,5 @@
 const Meeting = require("../model/Meeting");
+const Workspace = require("../model/Workspace");
 const { v4: uuidv4 } = require("uuid");
 const aiService = require("../config/aiService");
 
@@ -56,7 +57,7 @@ const findMeetingByRoomId = async (rawRoomId) => {
 
 exports.createMeeting = async (req, res) => {
     try {
-        const { title } = req.body;
+        const { title, workspaceId } = req.body;
         const finalTitle = (title && String(title).trim())
             ? String(title).trim()
             : `${req.user?.fullName || "Instant"}'s Meeting`;
@@ -66,6 +67,7 @@ exports.createMeeting = async (req, res) => {
             roomId,
             title: finalTitle,
             host: req.user._id,
+            workspaceId: workspaceId || undefined,
             participants: [{ user: req.user._id, name: req.user?.fullName || "Host" }]
         });
 
@@ -131,14 +133,22 @@ exports.joinMeeting = async (req, res) => {
 
 exports.getMeetingHistory = async (req, res) => {
     try {
-        const meetings = await Meeting.find({
+        const { workspaceId } = req.query;
+        const filter = {
             $or: [
                 { host: req.user._id },
                 { "participants.user": req.user._id }
             ]
-        })
-        .populate("host", "fullName email")
-        .sort({ createdAt: -1 });
+        };
+
+        if (workspaceId && workspaceId !== "all") {
+            filter.workspaceId = workspaceId;
+        }
+
+        const meetings = await Meeting.find(filter)
+            .populate("host", "fullName email")
+            .populate("workspaceId", "name")
+            .sort({ createdAt: -1 });
 
         res.status(200).json({
             success: true,
@@ -344,10 +354,30 @@ exports.endMeeting = async (req, res) => {
             conversationText = `${conversationText}\n\n[Meeting Notes]:\n${meeting.notes.trim()}`;
         }
 
-        const aiResult = await aiService.generateSummaryAndActionItems(conversationText, meeting.title);
+        // Fetch workspace team members to assist AI identification of assignees
+        let workspaceMembers = [];
+        if (meeting.workspaceId) {
+            try {
+                const ws = await Workspace.findById(meeting.workspaceId).populate("members", "fullName email");
+                if (ws && ws.members) workspaceMembers = ws.members;
+            } catch (wsErr) {
+                console.warn("Could not fetch workspace members for AI context:", wsErr.message);
+            }
+        }
+        if (meeting.participants && meeting.participants.length > 0) {
+            for (const p of meeting.participants) {
+                if (p.name && !workspaceMembers.some(m => m.fullName === p.name)) {
+                    workspaceMembers.push({ fullName: p.name });
+                }
+            }
+        }
+
+        const aiResult = await aiService.generateSummaryAndActionItems(conversationText, meeting.title, workspaceMembers);
         meeting.summary = aiResult.summary;
         meeting.actionItems = (aiResult.actionItems || []).map(item => ({
             title: item.title,
+            description: item.description || "",
+            priority: item.priority || "medium",
             assigneeName: item.assigneeName || "",
             status: "pending"
         }));
@@ -407,6 +437,87 @@ exports.leaveMeeting = async (req, res) => {
         res.status(200).json({
             success: true,
             message: "Left meeting successfully"
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            message: err.message
+        });
+    }
+};
+
+exports.whisperTranscribeAudioChunk = async (req, res) => {
+    try {
+        const { roomId } = req.params;
+        const meeting = await findMeetingByRoomId(roomId);
+        if (!meeting) {
+            return res.status(404).json({
+                success: false,
+                message: "Meeting not found"
+            });
+        }
+
+        if (!req.file || !req.file.buffer || req.file.buffer.length < 500) {
+            return res.status(400).json({
+                success: false,
+                message: "No audio stream data provided"
+            });
+        }
+
+        const speakerName = req.body.sender || req.user?.fullName || "Speaker";
+        const speakerUserId = req.user?._id || req.body.senderUser || null;
+
+        let transcribedText = "";
+        try {
+            transcribedText = await aiService.transcribeAudioWithWhisper(
+                req.file.buffer,
+                req.file.originalname || `audio_${Date.now()}.webm`
+            );
+        } catch (aiErr) {
+            console.warn("Whisper audio processing warning:", aiErr.message);
+            return res.status(200).json({
+                success: false,
+                fallback: true,
+                message: aiErr.message
+            });
+        }
+
+        if (!transcribedText || !transcribedText.trim()) {
+            return res.status(200).json({
+                success: true,
+                empty: true,
+                message: "Audio chunk was silent or contained no recognizable speech"
+            });
+        }
+
+        const transcriptItem = {
+            sender: speakerName,
+            senderUser: speakerUserId,
+            text: transcribedText.trim(),
+            timestamp: new Date()
+        };
+
+        if (!meeting.transcript) meeting.transcript = [];
+        meeting.transcript.push(transcriptItem);
+        await meeting.save();
+
+        // Broadcast live transcription via Socket.IO
+        const io = req.app.get("io");
+        if (io) {
+            io.to(meeting.roomId).emit("receive-transcript", transcriptItem);
+            if (meeting.workspaceId) {
+                io.to(`workspace-${meeting.workspaceId}`).emit("analytics-updated", {
+                    workspaceId: meeting.workspaceId
+                });
+            }
+        }
+
+        res.status(200).json({
+            success: true,
+            text: transcribedText.trim(),
+            transcript: transcriptItem,
+            meetingId: meeting._id,
+            workspaceId: meeting.workspaceId
         });
     } catch (err) {
         res.status(500).json({

@@ -18,6 +18,10 @@ const meetingSchema = new mongoose.Schema(
         ref: "User",
         required: true
     },
+    workspaceId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Workspace"
+    },
     participants: [
         {
             user: {
@@ -99,6 +103,15 @@ const meetingSchema = new mongoose.Schema(
             title: {
                 type: String,
                 required: true
+            },
+            description: {
+                type: String,
+                default: ""
+            },
+            priority: {
+                type: String,
+                enum: ["low", "medium", "high"],
+                default: "medium"
             },
             assigneeName: {
                 type: String,

@@ -1,12 +1,20 @@
 /**
  * AI Service for formatting transcripts, summarizing meetings, and extracting action items.
- * Supports OpenAI API if configured, otherwise falls back to a smart heuristic mock generator.
+ * Supports OpenAI API (including Whisper speech-to-text) if configured, with an advanced local fallback engine.
  */
 
-exports.generateSummaryAndActionItems = async (transcriptText, meetingTitle) => {
+exports.generateSummaryAndActionItems = async (transcriptText, meetingTitle, workspaceMembers = []) => {
+    const memberNames = Array.isArray(workspaceMembers) 
+        ? workspaceMembers.map(m => m.fullName || m.name).filter(Boolean)
+        : [];
+
     // Check if OpenAI API Key is configured
     if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim() !== "") {
         try {
+            const memberPrompt = memberNames.length > 0 
+                ? `Known workspace team members: ${memberNames.join(", ")}.\nWhen assigning an action item, prioritize matching one of these team members.`
+                : "";
+
             const response = await fetch("https://api.openai.com/v1/chat/completions", {
                 method: "POST",
                 headers: {
@@ -14,18 +22,28 @@ exports.generateSummaryAndActionItems = async (transcriptText, meetingTitle) => 
                     "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
                 },
                 body: JSON.stringify({
-                    model: "gpt-4o-mini", // Cost-effective model for enterprise applications
+                    model: "gpt-4o-mini",
                     messages: [
                         {
                             role: "system",
-                            content: `You are an expert AI meeting assistant. Analyze the meeting transcript provided and return a JSON object containing:
+                            content: `You are an expert AI meeting and project management assistant. Analyze the meeting transcript provided and return a JSON object containing:
 1. "summary": A concise, production-grade executive summary of the meeting.
-2. "actionItems": A list of items containing "title" (the task description) and "assigneeName" (the name of the person responsible, or blank if not clear).
+2. "actionItems": A list of extracted task action items. Each item must have:
+   - "title": Concise, actionable task title (e.g. "Implement user authentication flow")
+   - "description": Context or specific details mentioned in the meeting
+   - "priority": One of "low", "medium", or "high" based on urgency words
+   - "assigneeName": The exact full name of the responsible person if mentioned or assigned, or "" if unassigned.
+${memberPrompt}
 The JSON response format must be exactly:
 {
   "summary": "...",
   "actionItems": [
-    { "title": "Review marketing designs", "assigneeName": "Aman" }
+    {
+      "title": "Review marketing designs",
+      "description": "Inspect landing page mockups for the Q3 campaign",
+      "priority": "high",
+      "assigneeName": "Aman"
+    }
   ]
 }`
                         },
@@ -35,7 +53,7 @@ The JSON response format must be exactly:
                         }
                     ],
                     response_format: { type: "json_object" },
-                    temperature: 0.5
+                    temperature: 0.4
                 })
             });
 
@@ -44,10 +62,17 @@ The JSON response format must be exactly:
                 const result = JSON.parse(data.choices[0].message.content);
                 return {
                     summary: result.summary || "No summary could be extracted.",
-                    actionItems: result.actionItems || []
+                    actionItems: (result.actionItems || []).map(item => ({
+                        title: item.title || "Untitled Action Item",
+                        description: item.description || "",
+                        priority: ["low", "medium", "high"].includes(item.priority?.toLowerCase()) 
+                            ? item.priority.toLowerCase() 
+                            : "medium",
+                        assigneeName: item.assigneeName || ""
+                    }))
                 };
             } else {
-                console.warn("OpenAI API returned non-OK status. Falling back to mock generator.");
+                console.warn("OpenAI API returned non-OK status. Falling back to local intelligence engine.");
             }
         } catch (error) {
             console.error("Error communicating with OpenAI:", error);
@@ -55,73 +80,110 @@ The JSON response format must be exactly:
         }
     }
 
-    // Heuristic Local Simulation Fallback
-    console.log("Using Heuristic Local AI Fallback Service for summary and action items.");
+    // Heuristic Local AI Fallback Engine
+    console.log("Using Heuristic Local AI Engine for meeting summary & action items extraction.");
     
-    // Default action items
     let summary = "";
     let actionItems = [];
 
     if (!transcriptText || transcriptText.trim().length < 20) {
-        summary = `In this meeting, the team aligned on the key deliverables for the "${meetingTitle}" project. The discussion focused on configuring the environment, resolving setup queries, and establishing milestones for the upcoming sprint.`;
+        summary = `In this meeting, the team aligned on key deliverables for "${meetingTitle}". The discussion established operational milestones and setup steps.`;
         actionItems = [
-            { title: "Set up the local environment and configurations", assigneeName: "Developer" },
-            { title: "Review the system database connection status", assigneeName: "Admin" },
-            { title: "Draft the project architecture specifications sheet", assigneeName: "" }
+            {
+                title: `Finalize requirements for ${meetingTitle}`,
+                description: "Review setup specifications and project backlog items.",
+                priority: "medium",
+                assigneeName: memberNames[0] || ""
+            },
+            {
+                title: "Verify team database & workspace configurations",
+                description: "Ensure all team members have access to the active workspace.",
+                priority: "high",
+                assigneeName: memberNames[1] || memberNames[0] || ""
+            }
         ];
     } else {
-        // Try to parse transcript for names and instructions
-        // Let's extract lines that sound like tasks
         const lines = transcriptText.split("\n");
         const detectedActions = [];
         
-        // Find lines with action words: "should", "will", "need to", "assign", "action", "task", "todo"
-        const actionKeywords = ["should", "will", "need to", "assign", "task", "todo", "fix", "create", "implement", "update"];
-        
+        // Priority keywords
+        const highPriorityWords = ["urgent", "immediately", "critical", "asap", "today", "emergency", "blocker", "p0", "p1", "high priority"];
+        const lowPriorityWords = ["later", "eventually", "low priority", "optional", "minor", "nice to have", "someday"];
+        const actionKeywords = ["should", "will", "need to", "assign", "task", "todo", "fix", "create", "implement", "update", "deploy", "review", "test", "build"];
+
         for (const line of lines) {
             const lowerLine = line.toLowerCase();
-            const hasKeyword = actionKeywords.some(keyword => lowerLine.includes(keyword));
+            const hasActionWord = actionKeywords.some(keyword => lowerLine.includes(keyword));
             
-            if (hasKeyword && line.includes(":")) {
+            if (hasActionWord && line.includes(":")) {
                 const parts = line.split(":");
-                const speaker = parts[0].trim();
+                const speaker = parts[0].replace(/\(Voice\)|\(Chat\)/gi, "").trim();
                 const text = parts.slice(1).join(":").trim();
                 
-                // Extract task description
+                // Determine priority
+                let priority = "medium";
+                if (highPriorityWords.some(w => lowerLine.includes(w))) {
+                    priority = "high";
+                } else if (lowPriorityWords.some(w => lowerLine.includes(w))) {
+                    priority = "low";
+                }
+
+                // Clean and format task title
                 let cleanTask = text
-                    .replace(/i will/i, "Implement")
-                    .replace(/we should/i, "Action:")
-                    .replace(/please/i, "")
-                    .replace(/you need to/i, "Need to")
+                    .replace(/^(i will|we should|please|you need to|can you|let's|need to)\s+/i, "")
+                    .replace(/^(make sure to|ensure that|don't forget to)\s+/i, "")
                     .trim();
                 
-                // Capitalize first letter
-                cleanTask = cleanTask.charAt(0).toUpperCase() + cleanTask.slice(1);
-                
-                // Guess assignee if mentioned
-                let assignee = "";
-                if (lowerLine.includes("aman") || lowerLine.includes("dev")) {
-                    assignee = "Aman";
-                } else if (lowerLine.includes("host") || lowerLine.includes("leader")) {
-                    assignee = "Host";
-                } else {
-                    assignee = speaker;
-                }
-                
-                if (cleanTask.length > 10) {
-                    detectedActions.push({ title: cleanTask, assigneeName: assignee });
+                if (cleanTask.length > 5) {
+                    cleanTask = cleanTask.charAt(0).toUpperCase() + cleanTask.slice(1);
+
+                    // Detect assignee: check workspace members first, then speaker
+                    let matchedAssignee = "";
+                    for (const member of memberNames) {
+                        const firstName = member.split(" ")[0].toLowerCase();
+                        if (lowerLine.includes(member.toLowerCase()) || lowerLine.includes(firstName)) {
+                            matchedAssignee = member;
+                            break;
+                        }
+                    }
+
+                    if (!matchedAssignee) {
+                        // Check if speaker matches a known member
+                        const speakerMatch = memberNames.find(m => m.toLowerCase().includes(speaker.toLowerCase()));
+                        matchedAssignee = speakerMatch || (speaker !== "Speaker" && speaker !== "Participant" ? speaker : "");
+                    }
+
+                    detectedActions.push({
+                        title: cleanTask.length > 80 ? cleanTask.substring(0, 80) + "..." : cleanTask,
+                        description: `Extracted from discussion by ${speaker}: "${text}"`,
+                        priority,
+                        assigneeName: matchedAssignee
+                    });
                 }
             }
         }
 
         if (detectedActions.length > 0) {
-            actionItems = detectedActions.slice(0, 5); // limit to 5
-            summary = `The team held a productive discussion on "${meetingTitle}". Key points discussed include alignment on tasks, action item allocations, and workflow coordination. Specific action items were assigned to: ${[...new Set(actionItems.map(a => a.assigneeName).filter(Boolean))].join(", ") || "the team"}.`;
+            // Deduplicate actions by title similarity
+            const uniqueActions = [];
+            for (const act of detectedActions) {
+                if (!uniqueActions.some(u => u.title.toLowerCase() === act.title.toLowerCase())) {
+                    uniqueActions.push(act);
+                }
+            }
+            actionItems = uniqueActions.slice(0, 6);
+
+            const assignedMembers = [...new Set(actionItems.map(a => a.assigneeName).filter(Boolean))];
+            summary = `The team held an interactive session on "${meetingTitle}". Key discussion topics included task coordination, sprint deliverables, and action items.\n\nActions were identified and allocated to: ${assignedMembers.length > 0 ? assignedMembers.join(", ") : "team members"}. All deliverables have been formatted for Kanban task conversion.`;
         } else {
-            summary = `The meeting "${meetingTitle}" concluded with team members sharing general updates. The discussions touched upon current status reports, blocker updates, and collaborative strategies for next week's launch.`;
+            summary = `The meeting "${meetingTitle}" concluded with team members sharing general updates. The discussions covered status reports, operational workflows, and team alignment.`;
             actionItems = [
-                { title: "Follow up on the discussions raised in the meeting", assigneeName: "" },
-                { title: "Review tasks listed in the shared workspaces", assigneeName: "Aman" }
+                {
+                    title: `Follow up on items discussed in ${meetingTitle}`,
+                    description: "Review notes and action items with the project team.",
+                    priority: "medium",
+                    assigneeName: memberNames[0] || ""
+                }
             ];
         }
     }
@@ -130,4 +192,34 @@ The JSON response format must be exactly:
         summary,
         actionItems
     };
+};
+
+/**
+ * Transcribe recorded audio with OpenAI Whisper API (if configured)
+ */
+exports.transcribeAudioWithWhisper = async (audioBuffer, filename = "audio.webm") => {
+    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.trim() === "") {
+        throw new Error("OPENAI_API_KEY is not configured for Whisper transcription.");
+    }
+
+    const blob = new Blob([audioBuffer], { type: "audio/webm" });
+    const formData = new FormData();
+    formData.append("file", blob, filename);
+    formData.append("model", "whisper-1");
+
+    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+        },
+        body: formData
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Whisper API error: ${response.status} - ${errorText}`);
+    }
+
+    const result = await response.json();
+    return result.text || "";
 };
