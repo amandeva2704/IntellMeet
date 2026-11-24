@@ -57,6 +57,10 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
     const [audioBlocked, setAudioBlocked] = useState(false);
     const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
 
+    const hasVideoTrack = Boolean(
+        stream && stream.getVideoTracks().length > 0 && stream.getVideoTracks().some((t) => t.enabled)
+    );
+
     // Sync MediaStream to DOM video and audio elements
     useEffect(() => {
         if (!stream) {
@@ -88,7 +92,9 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
                 videoRef.current.srcObject = stream;
             }
             videoRef.current.muted = true; // Always muted so browser autoplay policy NEVER blocks it
-            videoRef.current.play().catch(console.warn);
+            videoRef.current.play().then(() => {
+                setHasRemoteVideo(true);
+            }).catch(console.warn);
 
             const vTracks = stream.getVideoTracks();
             if (vTracks.length > 0 && vTracks.some((t) => t.enabled)) {
@@ -97,12 +103,14 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
         }
 
         const handleTrackActivity = () => {
-            if (!videoRef.current || !stream) return;
+            if (!stream) return;
             const vTracks = stream.getVideoTracks();
             const isLive = vTracks.length > 0 && vTracks.some((t) => t.enabled && t.readyState === "live");
-            setHasRemoteVideo(isLive);
             if (isLive) {
-                videoRef.current.play().catch(console.warn);
+                setHasRemoteVideo(true);
+                if (videoRef.current) {
+                    videoRef.current.play().catch(console.warn);
+                }
             }
             if (audioRef.current && stream.getAudioTracks().length > 0) {
                 audioRef.current.play().then(() => setAudioBlocked(false)).catch(() => {});
@@ -129,15 +137,21 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
         };
     }, [stream]);
 
-    // Global click listener to unlock autoplay audio if browser blocked it
+    // Global unlock listener for clicks, touch, and keys
     useEffect(() => {
-        const handleGlobalClick = () => {
+        const unlockAudio = () => {
             if (audioRef.current && stream && stream.getAudioTracks().length > 0) {
                 audioRef.current.play().then(() => setAudioBlocked(false)).catch(() => {});
             }
         };
-        window.addEventListener("click", handleGlobalClick);
-        return () => window.removeEventListener("click", handleGlobalClick);
+        window.addEventListener("click", unlockAudio);
+        window.addEventListener("touchstart", unlockAudio);
+        window.addEventListener("keydown", unlockAudio);
+        return () => {
+            window.removeEventListener("click", unlockAudio);
+            window.removeEventListener("touchstart", unlockAudio);
+            window.removeEventListener("keydown", unlockAudio);
+        };
     }, [stream]);
 
     const handleEnableAudio = () => {
@@ -145,6 +159,8 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
             audioRef.current.play().then(() => setAudioBlocked(false)).catch(console.error);
         }
     };
+
+    const isVideoVisible = (hasRemoteVideo || hasVideoTrack) && Boolean(stream);
 
     return (
         <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center">
@@ -173,12 +189,12 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
                     setHasRemoteVideo(true);
                 }}
                 className={`w-full h-full object-cover transition-opacity duration-300 ${
-                    hasRemoteVideo && stream ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
+                    isVideoVisible ? "opacity-100 relative z-10" : "opacity-0 absolute inset-0 pointer-events-none"
                 }`}
             />
 
             {/* Avatar placeholder shown when video is inactive, camera is off, or stream is connecting */}
-            {(!hasRemoteVideo || !stream) && (
+            {!isVideoVisible && (
                 <div className="text-center space-y-2 relative z-0">
                     <div className="w-16 h-16 rounded-full bg-violet-600/10 border border-violet-500/20 text-violet-400 font-extrabold text-lg flex items-center justify-center mx-auto">
                         {peer.user?.fullName?.charAt(0).toUpperCase() || "P"}
@@ -328,12 +344,23 @@ export default function MeetingRoom() {
 
             // Replace tracks on any existing peer connections
             peersRef.current.forEach((pc) => {
+                const transceivers = pc.getTransceivers();
                 stream.getTracks().forEach((track) => {
-                    const sender = pc.getSenders().find((s) => s.track?.kind === track.kind);
-                    if (sender) {
-                        sender.replaceTrack(track).catch(console.warn);
+                    const matchingTransceiver = transceivers.find((t) =>
+                        (t.sender.track && t.sender.track.kind === track.kind) ||
+                        (t.receiver.track && t.receiver.track.kind === track.kind)
+                    );
+                    if (matchingTransceiver) {
+                        matchingTransceiver.sender.replaceTrack(track).catch(console.warn);
+                        if (matchingTransceiver.direction !== "stopped") {
+                            matchingTransceiver.direction = "sendrecv";
+                        }
                     } else {
-                        pc.addTrack(track, stream);
+                        try {
+                            pc.addTrack(track, stream);
+                        } catch (e) {
+                            console.warn("addTrack error:", e);
+                        }
                     }
                 });
             });
@@ -448,18 +475,24 @@ export default function MeetingRoom() {
         }
     };
 
-    // Helper: Attach local tracks to a peer connection (reuses transceivers or adds cleanly)
+    // Helper: Attach local tracks to a peer connection (matches existing transceivers or adds cleanly)
     const attachLocalTracks = async (pc: RTCPeerConnection) => {
         if (!localStreamRef.current) return;
 
         const localTracks = localStreamRef.current.getTracks();
-        const senders = pc.getSenders();
+        const transceivers = pc.getTransceivers();
 
         for (const track of localTracks) {
-            const sender = senders.find((s) => s.track && s.track.kind === track.kind);
-            if (sender) {
+            const matchingTransceiver = transceivers.find((t) =>
+                (t.sender.track && t.sender.track.kind === track.kind) ||
+                (t.receiver.track && t.receiver.track.kind === track.kind)
+            );
+            if (matchingTransceiver) {
                 try {
-                    await sender.replaceTrack(track);
+                    await matchingTransceiver.sender.replaceTrack(track);
+                    if (matchingTransceiver.direction !== "stopped") {
+                        matchingTransceiver.direction = "sendrecv";
+                    }
                 } catch (err) {
                     console.warn(`replaceTrack error for ${track.kind}:`, err);
                 }
@@ -473,7 +506,7 @@ export default function MeetingRoom() {
         }
     };
 
-    // Helper: Create an RTCPeerConnection for a target peer with pre-attached local tracks
+    // Helper: Create an RTCPeerConnection for a target peer
     const createPeerConnection = (targetSocketId: string) => {
         if (peersRef.current.has(targetSocketId)) {
             return peersRef.current.get(targetSocketId)!;
@@ -481,17 +514,6 @@ export default function MeetingRoom() {
 
         const pc = new RTCPeerConnection(ICE_SERVERS);
         peersRef.current.set(targetSocketId, pc);
-
-        // ALWAYS pre-add local tracks immediately so both Offer and Answer have sendrecv audio/video
-        if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach((track) => {
-                try {
-                    pc.addTrack(track, localStreamRef.current!);
-                } catch (e) {
-                    console.warn("Error pre-attaching track:", e);
-                }
-            });
-        }
 
         // Send gathered ICE candidate to peer
         pc.onicecandidate = (event) => {
@@ -555,8 +577,14 @@ export default function MeetingRoom() {
     const initiateCallToPeer = async (peerSocketId: string, callerSafeUser: any) => {
         try {
             const existingPc = peersRef.current.get(peerSocketId);
-            if (existingPc && (existingPc.connectionState === "connected" || existingPc.iceConnectionState === "connected")) {
-                console.log(`Peer connection to ${peerSocketId} is already connected, skipping re-initiation.`);
+            if (
+                existingPc &&
+                (existingPc.connectionState === "connected" ||
+                 existingPc.iceConnectionState === "connected" ||
+                 existingPc.connectionState === "connecting" ||
+                 existingPc.iceConnectionState === "checking")
+            ) {
+                console.log(`Peer connection to ${peerSocketId} is already active or negotiating, skipping re-initiation.`);
                 return;
             }
             if (existingPc) {
@@ -695,16 +723,6 @@ export default function MeetingRoom() {
                 return [...prev, { socketId, user: joiningUser }];
             });
             toast.success(`${joiningUser?.fullName || "A peer"} joined the call`);
-
-            // Host Fallback: If no peer connection is active within 2.5s, initiate call to newcomer
-            setTimeout(() => {
-                const pc = peersRef.current.get(socketId);
-                if (!pc || (pc.connectionState !== "connected" && pc.iceConnectionState !== "connected" && pc.signalingState === "stable")) {
-                    console.log(`🔄 Host Fallback: Initiating WebRTC call to newcomer ${socketId}`);
-                    const safeUser = user || { _id: "user_" + Date.now(), fullName: "Host" };
-                    initiateCallToPeer(socketId, safeUser);
-                }
-            }, 2500);
         };
 
         const handleUserJoinedSignal = async ({ callerId, callerUser, signal }: any) => {
