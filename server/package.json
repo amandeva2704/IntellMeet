@@ -7,7 +7,8 @@
     "start": "node server.js",
     "dev": "nodemon server.js",
     "sync-db": "node scripts/sync-local-to-atlas.js",
-    "test-webrtc": "node scripts/test-webrtc.js"
+    "test-webrtc": "node scripts/test-webrtc.js",
+    "test-mesh": "node scripts/test-multiuser-mesh.js"
   },
   "dependencies": {
     "bcrypt": "^6.0.0",
