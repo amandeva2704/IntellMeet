@@ -62,7 +62,9 @@ app.use("/api/tasks", taskRoutes);
 app.use("/api/workspaces", workspaceRoutes);
 app.use("/api/analytics", analyticsRoutes);
 
-app.get("/api/db-status", (req, res) => {
+const { getConnectionStatus } = require("./config/db");
+
+app.get("/api/db-status", async (req, res) => {
     const stateMap = {
         0: "disconnected",
         1: "connected",
@@ -73,6 +75,18 @@ app.get("/api/db-status", (req, res) => {
     const host = mongoose.connection.host || "none";
     const isCloud = Boolean(host && !host.includes("127.0.0.1") && !host.includes("localhost") && host !== "none");
 
+    let usersCount = 0;
+    let registeredEmails = [];
+    try {
+        if (state === 1) {
+            usersCount = await mongoose.connection.db.collection("users").countDocuments();
+            const sample = await mongoose.connection.db.collection("users").find({}, { projection: { email: 1 } }).limit(20).toArray();
+            registeredEmails = sample.map(u => u.email);
+        }
+    } catch (e) {}
+
+    const connStatus = getConnectionStatus ? getConnectionStatus() : {};
+
     res.json({
         success: true,
         connectionState: stateMap[state] || "unknown",
@@ -81,9 +95,23 @@ app.get("/api/db-status", (req, res) => {
         databaseName: mongoose.connection.name || "none",
         isCloudAtlas: isCloud,
         isLocalFallback: !isCloud && state === 1,
+        usersCount,
+        registeredEmails,
+        diagnostics: {
+            configuredEnvKeys: {
+                MONGO_URI: Boolean(process.env.MONGO_URI),
+                MONGODB_URI: Boolean(process.env.MONGODB_URI),
+                DATABASE_URL: Boolean(process.env.DATABASE_URL),
+                MONGO_URL: Boolean(process.env.MONGO_URL),
+                JWT_SECRET: Boolean(process.env.JWT_SECRET)
+            },
+            attemptedEnvKey: connStatus.attemptedUriKey || null,
+            targetHost: connStatus.sanitizedTargetHost || null,
+            atlasError: connStatus.atlasError || null
+        },
         message: isCloud 
             ? "Connected to MongoDB Atlas Cloud. Data is permanently persistent."
-            : "Running on temporary local database. Configure MONGO_URI in Render dashboard for permanent cloud persistence."
+            : "Running on temporary local database. User accounts will be lost when Render restarts unless a working MONGO_URI/MONGODB_URI is configured."
     });
 });
 

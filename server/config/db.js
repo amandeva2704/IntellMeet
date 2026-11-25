@@ -3,6 +3,15 @@ const fs = require("fs");
 const path = require("path");
 
 let localMongoInstance = null;
+let lastConnectionStatus = {
+    attemptedUriKey: null,
+    sanitizedTargetHost: null,
+    atlasError: null,
+    connectedToAtlas: false,
+    usingFallback: false
+};
+
+const getConnectionStatus = () => ({ ...lastConnectionStatus });
 
 const startLocalMongo = async () => {
     try {
@@ -56,7 +65,24 @@ const migrateLegacyData = async () => {
 };
 
 const connectDB = async () => {
-    const mongoUri = process.env.MONGO_URI;
+    // Check all standard environment variable names used across cloud platforms
+    const candidateKeys = ["MONGO_URI", "MONGODB_URI", "DATABASE_URL", "MONGO_URL"];
+    let mongoUri = null;
+    let selectedKey = null;
+
+    for (const key of candidateKeys) {
+        if (process.env[key] && typeof process.env[key] === "string" && !process.env[key].includes("<username>")) {
+            mongoUri = process.env[key].trim();
+            selectedKey = key;
+            break;
+        }
+    }
+
+    lastConnectionStatus.attemptedUriKey = selectedKey;
+    if (mongoUri) {
+        const hostMatch = mongoUri.match(/@([^/?#]+)/);
+        lastConnectionStatus.sanitizedTargetHost = hostMatch ? hostMatch[1] : "configured-uri";
+    }
 
     // 1. If explicit local flag is set, start local directly
     if (process.env.USE_LOCAL_MONGO === "true") {
@@ -64,17 +90,24 @@ const connectDB = async () => {
         const localUri = await startLocalMongo();
         await mongoose.connect(localUri, { dbName: "intellmeet" });
         await migrateLegacyData();
+        lastConnectionStatus.usingFallback = true;
         console.log("✅ Connected to Local Persistent MongoDB successfully!");
         return;
     }
 
-    // 2. Attempt connecting to configured MONGO_URI (e.g. MongoDB Atlas)
-    if (mongoUri && !mongoUri.includes("<username>")) {
+    // 2. Attempt connecting to configured MongoDB Atlas / Cloud database
+    if (mongoUri) {
         try {
-            console.log("⏳ Connecting to MongoDB Atlas...");
+            console.log(`⏳ Connecting to MongoDB Atlas using ${selectedKey}...`);
             const conn = await mongoose.connect(mongoUri, {
+                dbName: "intellmeet",
                 serverSelectionTimeoutMS: 10000 // Allow up to 10s for Atlas SRV/DNS & TLS handshake
             });
+
+            await migrateLegacyData();
+            lastConnectionStatus.connectedToAtlas = true;
+            lastConnectionStatus.usingFallback = false;
+            lastConnectionStatus.atlasError = null;
 
             console.log("==========================================");
             console.log("✅ MongoDB Atlas Connected Successfully!");
@@ -84,6 +117,9 @@ const connectDB = async () => {
             console.log("==========================================");
             return;
         } catch (err) {
+            lastConnectionStatus.atlasError = err.message;
+            lastConnectionStatus.connectedToAtlas = false;
+
             console.warn("==========================================");
             console.warn("⚠️ MongoDB Atlas connection failed:");
             console.warn(`   Error message: ${err.message}`);
@@ -93,7 +129,7 @@ const connectDB = async () => {
                 console.warn("      1. Check if your cluster is PAUSED. If so, click 'Resume'.");
                 console.warn("      2. If deleted or recreated, click 'Connect' -> 'Drivers' and copy the fresh connection string.");
             } else if (err.message.includes("Authentication failed") || err.message.includes("bad auth")) {
-                console.warn("   🔍 Cause: Database username or password in MONGO_URI is incorrect.");
+                console.warn("   🔍 Cause: Database username or password in connection URI is incorrect.");
                 console.warn("   💡 Fix: Verify your MongoDB Atlas database user and password.");
             } else if (err.message.includes("timed out") || err.message.includes("ECONNREFUSED")) {
                 console.warn("   🔍 Cause: Network connection timed out.");
@@ -102,10 +138,13 @@ const connectDB = async () => {
             console.warn("💡 Falling back to Local Persistent MongoDB...");
             console.warn("==========================================");
         }
+    } else {
+        lastConnectionStatus.atlasError = "No valid cloud MongoDB URI found in environment variables (MONGO_URI or MONGODB_URI)";
     }
 
     // 3. Fallback to Local Persistent MongoDB so app never crashes
     try {
+        lastConnectionStatus.usingFallback = true;
         const isCloudDeployment = !!(process.env.RENDER || process.env.VERCEL || (process.env.NODE_ENV === "production" && !process.env.USE_LOCAL_MONGO));
         const localUri = await startLocalMongo();
         const conn = await mongoose.connect(localUri, { dbName: "intellmeet" });
@@ -118,7 +157,7 @@ const connectDB = async () => {
             console.warn("⚠️ IMPORTANT NOTE FOR CLOUD HOSTING (e.g. Render):");
             console.warn("   Render free-tier instances sleep after 15m and wipe ephemeral container files.");
             console.warn("   To prevent users from having to register again after server sleep,");
-            console.warn("   configure MONGO_URI in your Render service environment variables.");
+            console.warn("   configure MONGO_URI or MONGODB_URI in your Render service environment variables.");
         } else {
             console.log("🎉 User Login, Register, and all APIs will persist across server restarts!");
         }
@@ -152,3 +191,4 @@ process.on("SIGTERM", async () => {
 });
 
 module.exports = connectDB;
+module.exports.getConnectionStatus = getConnectionStatus;

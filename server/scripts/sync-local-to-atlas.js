@@ -7,10 +7,10 @@ const mongoose = require("mongoose");
 const path = require("path");
 const fs = require("fs");
 
-const targetUri = process.argv[2] || process.env.TARGET_MONGO_URI;
+const targetUri = process.argv[2] || process.env.TARGET_MONGO_URI || process.env.MONGODB_URI || process.env.MONGO_URI;
 
-if (!targetUri) {
-    console.error("❌ Please provide the target MongoDB Atlas URI as an argument:");
+if (!targetUri || targetUri.includes("<username>")) {
+    console.error("❌ Please provide the target MongoDB Atlas URI as an argument or in environment variables:");
     console.error("   node server/scripts/sync-local-to-atlas.js \"mongodb+srv://user:pass@cluster.mongodb.net/intellmeet?retryWrites=true&w=majority\"");
     process.exit(1);
 }
