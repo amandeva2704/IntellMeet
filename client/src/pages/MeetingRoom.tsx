@@ -264,6 +264,7 @@ export default function MeetingRoom() {
     const [isTranscribing, setIsTranscribing] = useState(false);
     const recognitionRef = useRef<any>(null);
     const audioRecorderRef = useRef<MediaRecorder | null>(null);
+    const whisperTimeoutRef = useRef<any>(null);
     const isInMeetingRef = useRef<boolean>(false);
     const micEnabledRef = useRef<boolean>(true);
 
@@ -1000,16 +1001,14 @@ export default function MeetingRoom() {
         setIsTranscribing(false);
     };
 
-    // Continuous Whisper audio capture via MediaRecorder (chunked audio slices)
+    // Continuous Whisper audio capture with standalone, valid WebM headers
     const startWhisperAudioCapture = () => {
         if (!localStreamRef.current) return;
         const audioTracks = localStreamRef.current.getAudioTracks();
         if (audioTracks.length === 0) return;
 
         try {
-            if (audioRecorderRef.current && audioRecorderRef.current.state !== "inactive") {
-                audioRecorderRef.current.stop();
-            }
+            stopWhisperAudioCapture();
 
             const audioStream = new MediaStream(audioTracks);
             const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") 
@@ -1017,35 +1016,77 @@ export default function MeetingRoom() {
                 : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
 
             const options = mimeType ? { mimeType } : undefined;
-            const recorder = new MediaRecorder(audioStream, options);
 
-            recorder.ondataavailable = async (e: BlobEvent) => {
-                if (e.data && e.data.size > 2000 && micEnabledRef.current && roomId) {
-                    try {
-                        const formData = new FormData();
-                        formData.append("audio", e.data, `voice_${user?._id || "user"}_${Date.now()}.webm`);
-                        formData.append("sender", user?.fullName || "Speaker");
-                        if (user?._id) formData.append("senderUser", user._id);
+            const recordSlice = () => {
+                if (!isInMeetingRef.current || !micEnabledRef.current || !localStreamRef.current) return;
 
-                        await api.post(`/meetings/${roomId}/whisper-transcribe`, formData, {
-                            headers: { "Content-Type": "multipart/form-data" }
-                        });
-                    } catch (err: any) {
-                        // Silent catch on network / chunk processing
-                    }
+                const recordedChunks: Blob[] = [];
+                let recorder: MediaRecorder;
+                try {
+                    recorder = new MediaRecorder(audioStream, options);
+                } catch (e) {
+                    console.warn("MediaRecorder creation error:", e);
+                    return;
                 }
+
+                recorder.ondataavailable = (e: BlobEvent) => {
+                    if (e.data && e.data.size > 0) {
+                        recordedChunks.push(e.data);
+                    }
+                };
+
+                recorder.onstop = async () => {
+                    if (recordedChunks.length === 0) return;
+                    const audioBlob = new Blob(recordedChunks, { type: mimeType || "audio/webm" });
+
+                    // Only send if slice contains audible data (> 4KB)
+                    if (audioBlob.size > 4000 && micEnabledRef.current && roomId) {
+                        try {
+                            const formData = new FormData();
+                            formData.append("audio", audioBlob, `voice_${user?._id || "user"}_${Date.now()}.webm`);
+                            formData.append("sender", user?.fullName || "Speaker");
+                            if (user?._id) formData.append("senderUser", user._id);
+
+                            const res = await api.post(`/meetings/${roomId}/whisper-transcribe`, formData, {
+                                headers: { "Content-Type": "multipart/form-data" }
+                            });
+                            if (res.data?.text) {
+                                console.log("🎙️ Whisper transcribed speech:", res.data.text);
+                            }
+                        } catch (err: any) {
+                            // Silent catch on network / chunk processing
+                        }
+                    }
+                };
+
+                recorder.start();
+                audioRecorderRef.current = recorder;
+
+                // Rotate every 6 seconds to generate complete, standalone WebM files with valid EBML headers
+                whisperTimeoutRef.current = setTimeout(() => {
+                    if (recorder.state === "recording") {
+                        try {
+                            recorder.stop();
+                        } catch (e) {}
+                    }
+                    if (isInMeetingRef.current && micEnabledRef.current) {
+                        recordSlice();
+                    }
+                }, 6000);
             };
 
-            // Stream continuous audio chunks in 5000ms slices
-            recorder.start(5000);
-            audioRecorderRef.current = recorder;
-            console.log("🎙️ Whisper continuous audio capture active (5s slices)");
+            recordSlice();
+            console.log("🎙️ Whisper standalone slice audio capture active (6s cycles)");
         } catch (e) {
             console.warn("Could not start MediaRecorder for Whisper:", e);
         }
     };
 
     const stopWhisperAudioCapture = () => {
+        if (whisperTimeoutRef.current) {
+            clearTimeout(whisperTimeoutRef.current);
+            whisperTimeoutRef.current = null;
+        }
         if (audioRecorderRef.current && audioRecorderRef.current.state !== "inactive") {
             try {
                 audioRecorderRef.current.stop();

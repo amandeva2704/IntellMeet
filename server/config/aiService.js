@@ -8,21 +8,29 @@ exports.generateSummaryAndActionItems = async (transcriptText, meetingTitle, wor
         ? workspaceMembers.map(m => m.fullName || m.name).filter(Boolean)
         : [];
 
-    // Check if OpenAI API Key is configured
-    if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.trim() !== "") {
+    // Check if OpenAI or Groq API Key is configured
+    const apiKey = process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY;
+    const isGroq = !process.env.OPENAI_API_KEY && Boolean(process.env.GROQ_API_KEY);
+
+    if (apiKey && apiKey.trim() !== "") {
         try {
             const memberPrompt = memberNames.length > 0 
                 ? `Known workspace team members: ${memberNames.join(", ")}.\nWhen assigning an action item, prioritize matching one of these team members.`
                 : "";
 
-            const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            const endpoint = isGroq 
+                ? "https://api.groq.com/openai/v1/chat/completions"
+                : "https://api.openai.com/v1/chat/completions";
+            const model = isGroq ? "llama-3.3-70b-versatile" : "gpt-4o-mini";
+
+            const response = await fetch(endpoint, {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+                    "Authorization": `Bearer ${apiKey.trim()}`
                 },
                 body: JSON.stringify({
-                    model: "gpt-4o-mini",
+                    model,
                     messages: [
                         {
                             role: "system",
@@ -195,29 +203,37 @@ The JSON response format must be exactly:
 };
 
 /**
- * Transcribe recorded audio with OpenAI Whisper API (if configured)
+ * Transcribe recorded audio with OpenAI Whisper API or Groq Whisper API (if configured)
  */
 exports.transcribeAudioWithWhisper = async (audioBuffer, filename = "audio.webm") => {
-    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.trim() === "") {
-        throw new Error("OPENAI_API_KEY is not configured for Whisper transcription.");
+    const apiKey = process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY;
+    const isGroq = !process.env.OPENAI_API_KEY && Boolean(process.env.GROQ_API_KEY);
+
+    if (!apiKey || apiKey.trim() === "") {
+        throw new Error("Neither OPENAI_API_KEY nor GROQ_API_KEY is configured in your environment variables. Please configure an API key to enable Whisper speech transcription.");
     }
+
+    const endpoint = isGroq 
+        ? "https://api.groq.com/openai/v1/audio/transcriptions"
+        : "https://api.openai.com/v1/audio/transcriptions";
+    const model = isGroq ? "whisper-large-v3" : "whisper-1";
 
     const blob = new Blob([audioBuffer], { type: "audio/webm" });
     const formData = new FormData();
     formData.append("file", blob, filename);
-    formData.append("model", "whisper-1");
+    formData.append("model", model);
 
-    const response = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    const response = await fetch(endpoint, {
         method: "POST",
         headers: {
-            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+            "Authorization": `Bearer ${apiKey.trim()}`
         },
         body: formData
     });
 
     if (!response.ok) {
         const errorText = await response.text();
-        throw new Error(`Whisper API error: ${response.status} - ${errorText}`);
+        throw new Error(`Whisper API error (${isGroq ? "Groq" : "OpenAI"}): ${response.status} - ${errorText}`);
     }
 
     const result = await response.json();
