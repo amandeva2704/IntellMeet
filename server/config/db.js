@@ -80,13 +80,25 @@ const connectDB = async () => {
             console.log("✅ MongoDB Atlas Connected Successfully!");
             console.log(`🌐 Host: ${conn.connection.host}`);
             console.log(`📁 Database: ${conn.connection.name}`);
-            console.log("🎉 User accounts and meetings are permanently saved in the cloud!");
+            console.log("🎉 User accounts, workspaces, and meetings are permanently saved in the cloud!");
             console.log("==========================================");
             return;
         } catch (err) {
             console.warn("==========================================");
-            console.warn("⚠️ MongoDB Atlas connection timed out or unreachable:");
-            console.warn(`   Reason: ${err.message}`);
+            console.warn("⚠️ MongoDB Atlas connection failed:");
+            console.warn(`   Error message: ${err.message}`);
+            if (err.message.includes("ENOTFOUND") || err.message.includes("querySrv")) {
+                console.warn("   🔍 Cause: The cluster domain does not exist in DNS.");
+                console.warn("   💡 Fix: Log in to https://cloud.mongodb.com and:");
+                console.warn("      1. Check if your cluster is PAUSED. If so, click 'Resume'.");
+                console.warn("      2. If deleted or recreated, click 'Connect' -> 'Drivers' and copy the fresh connection string.");
+            } else if (err.message.includes("Authentication failed") || err.message.includes("bad auth")) {
+                console.warn("   🔍 Cause: Database username or password in MONGO_URI is incorrect.");
+                console.warn("   💡 Fix: Verify your MongoDB Atlas database user and password.");
+            } else if (err.message.includes("timed out") || err.message.includes("ECONNREFUSED")) {
+                console.warn("   🔍 Cause: Network connection timed out.");
+                console.warn("   💡 Fix: In MongoDB Atlas -> Network Access, ensure IP Access List includes 0.0.0.0/0 (Allow access from anywhere).");
+            }
             console.warn("💡 Falling back to Local Persistent MongoDB...");
             console.warn("==========================================");
         }

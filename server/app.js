@@ -52,6 +52,8 @@ app.use(express.urlencoded({ extended: true }));
 
 app.use(cookieParser());
 
+const mongoose = require("mongoose");
+
 app.use(morgan("dev"));
 
 app.use("/api/auth", authRoutes);
@@ -60,13 +62,37 @@ app.use("/api/tasks", taskRoutes);
 app.use("/api/workspaces", workspaceRoutes);
 app.use("/api/analytics", analyticsRoutes);
 
-app.get("/", (req, res) => {
+app.get("/api/db-status", (req, res) => {
+    const stateMap = {
+        0: "disconnected",
+        1: "connected",
+        2: "connecting",
+        3: "disconnecting"
+    };
+    const state = mongoose.connection.readyState;
+    const host = mongoose.connection.host || "none";
+    const isCloud = Boolean(host && !host.includes("127.0.0.1") && !host.includes("localhost") && host !== "none");
 
     res.json({
         success: true,
-        message: "Welcome to IntellMeet API"
+        connectionState: stateMap[state] || "unknown",
+        readyState: state,
+        host,
+        databaseName: mongoose.connection.name || "none",
+        isCloudAtlas: isCloud,
+        isLocalFallback: !isCloud && state === 1,
+        message: isCloud 
+            ? "Connected to MongoDB Atlas Cloud. Data is permanently persistent."
+            : "Running on temporary local database. Configure MONGO_URI in Render dashboard for permanent cloud persistence."
     });
+});
 
+app.get("/", (req, res) => {
+    res.json({
+        success: true,
+        message: "Welcome to IntellMeet API",
+        dbStatus: "/api/db-status"
+    });
 });
 
 
