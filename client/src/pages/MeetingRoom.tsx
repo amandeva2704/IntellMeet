@@ -25,29 +25,17 @@ const normalizeRoomId = (input?: string): string => {
     return clean;
 };
 
-// Ultra-fast, reliable global STUN and TURN relay configuration
+// Ultra-fast, reliable global STUN configuration (instant candidate gathering, 0 connection delay)
 const ICE_SERVERS: RTCConfiguration = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun1.l.google.com:19302" },
-        { urls: "stun:stun.cloudflare.com:3478" },
-        {
-            urls: "turn:openrelay.metered.ca:80",
-            username: "openrelay",
-            credential: "openrelay"
-        },
-        {
-            urls: "turn:openrelay.metered.ca:443",
-            username: "openrelay",
-            credential: "openrelay"
-        },
-        {
-            urls: "turn:openrelay.metered.ca:443?transport=tcp",
-            username: "openrelay",
-            credential: "openrelay"
-        }
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" },
+        { urls: "stun:stun.cloudflare.com:3478" }
     ],
-    iceCandidatePoolSize: 2
+    iceCandidatePoolSize: 0
 };
 
 // Sub-component to render remote peer video and audio feeds
@@ -57,11 +45,7 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
     const [audioBlocked, setAudioBlocked] = useState(false);
     const [hasRemoteVideo, setHasRemoteVideo] = useState(false);
 
-    const hasVideoTrack = Boolean(
-        stream && stream.getVideoTracks().length > 0 && stream.getVideoTracks().some((t) => t.enabled)
-    );
-
-    // Sync MediaStream to DOM video and audio elements
+    // Sync MediaStream to DOM video and audio elements on stream updates and track lifecycle events
     useEffect(() => {
         if (!stream) {
             setHasRemoteVideo(false);
@@ -70,74 +54,70 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
             return;
         }
 
-        // 1. Sync Audio Element
-        if (audioRef.current) {
-            if (audioRef.current.srcObject !== stream) {
-                audioRef.current.srcObject = stream;
-            }
-            if (stream.getAudioTracks().length > 0) {
-                audioRef.current.play().then(() => {
-                    setAudioBlocked(false);
-                }).catch((err) => {
-                    if (err.name === "NotAllowedError") {
-                        setAudioBlocked(true);
-                    }
-                });
-            }
-        }
-
-        // 2. Sync Video Element
-        if (videoRef.current) {
-            if (videoRef.current.srcObject !== stream) {
-                videoRef.current.srcObject = stream;
-            }
-            videoRef.current.muted = true; // Always muted so browser autoplay policy NEVER blocks it
-            videoRef.current.play().then(() => {
-                setHasRemoteVideo(true);
-            }).catch(console.warn);
-
+        const updateMediaState = () => {
             const vTracks = stream.getVideoTracks();
-            if (vTracks.length > 0 && vTracks.some((t) => t.enabled)) {
-                setHasRemoteVideo(true);
-            }
-        }
+            const aTracks = stream.getAudioTracks();
 
-        const handleTrackActivity = () => {
-            if (!stream) return;
-            const vTracks = stream.getVideoTracks();
-            const isLive = vTracks.length > 0 && vTracks.some((t) => t.enabled && t.readyState === "live");
-            if (isLive) {
-                setHasRemoteVideo(true);
-                if (videoRef.current) {
-                    videoRef.current.play().catch(console.warn);
+            const isVideoActive = vTracks.length > 0 && vTracks.some((t) => t.enabled && t.readyState === "live");
+            setHasRemoteVideo(isVideoActive);
+
+            // 1. Sync Video Element
+            if (videoRef.current) {
+                if (videoRef.current.srcObject !== stream) {
+                    videoRef.current.srcObject = stream;
                 }
+                videoRef.current.muted = true; // Video muted so browser autoplay policy never prevents rendering
+                videoRef.current.play().then(() => {
+                    if (isVideoActive) setHasRemoteVideo(true);
+                }).catch(console.warn);
             }
-            if (audioRef.current && stream.getAudioTracks().length > 0) {
-                audioRef.current.play().then(() => setAudioBlocked(false)).catch(() => {});
+
+            // 2. Sync Audio Element
+            if (audioRef.current) {
+                if (audioRef.current.srcObject !== stream) {
+                    audioRef.current.srcObject = stream;
+                }
+                if (aTracks.length > 0 && aTracks.some((t) => t.enabled)) {
+                    audioRef.current.play().then(() => {
+                        setAudioBlocked(false);
+                    }).catch((err) => {
+                        if (err.name === "NotAllowedError") {
+                            setAudioBlocked(true);
+                        }
+                    });
+                }
             }
         };
 
-        const tracks = stream.getTracks();
-        tracks.forEach((t) => {
-            t.addEventListener("mute", handleTrackActivity);
-            t.addEventListener("unmute", handleTrackActivity);
-            t.addEventListener("ended", handleTrackActivity);
+        // Immediate sync
+        updateMediaState();
+
+        // Listen for track additions, removals, and state changes (mute, unmute, ended)
+        stream.addEventListener("addtrack", updateMediaState);
+        stream.addEventListener("removetrack", updateMediaState);
+
+        const currentTracks = stream.getTracks();
+        currentTracks.forEach((t) => {
+            t.addEventListener("mute", updateMediaState);
+            t.addEventListener("unmute", updateMediaState);
+            t.addEventListener("ended", updateMediaState);
         });
 
-        // Periodic check to capture video frames as soon as ICE connection settles
-        const intervalId = setInterval(handleTrackActivity, 1000);
+        const intervalId = setInterval(updateMediaState, 1000);
 
         return () => {
             clearInterval(intervalId);
-            tracks.forEach((t) => {
-                t.removeEventListener("mute", handleTrackActivity);
-                t.removeEventListener("unmute", handleTrackActivity);
-                t.removeEventListener("ended", handleTrackActivity);
+            stream.removeEventListener("addtrack", updateMediaState);
+            stream.removeEventListener("removetrack", updateMediaState);
+            currentTracks.forEach((t) => {
+                t.removeEventListener("mute", updateMediaState);
+                t.removeEventListener("unmute", updateMediaState);
+                t.removeEventListener("ended", updateMediaState);
             });
         };
     }, [stream]);
 
-    // Global unlock listener for clicks, touch, and keys
+    // Global unlock listener for user gestures (click, touch, keys)
     useEffect(() => {
         const unlockAudio = () => {
             if (audioRef.current && stream && stream.getAudioTracks().length > 0) {
@@ -160,7 +140,10 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
         }
     };
 
-    const isVideoVisible = (hasRemoteVideo || hasVideoTrack) && Boolean(stream);
+    const hasVideoTrack = Boolean(
+        stream && stream.getVideoTracks().length > 0 && stream.getVideoTracks().some((t) => t.enabled)
+    );
+    const isVideoVisible = Boolean(stream && (hasRemoteVideo || hasVideoTrack));
 
     return (
         <div className="aspect-video max-w-2xl w-full h-full mx-auto rounded-3xl bg-[#0e0f14] border border-white/5 shadow-lg relative overflow-hidden flex items-center justify-center">
@@ -206,7 +189,7 @@ function RemoteVideoTile({ peer, stream }: { peer: { socketId: string; user: any
                 </div>
             )}
 
-            {/* Click-to-play Audio Unlock for mobile browsers */}
+            {/* Click-to-play Audio Unlock for mobile/restricted browsers */}
             {audioBlocked && (
                 <button
                     type="button"
@@ -476,16 +459,23 @@ export default function MeetingRoom() {
     };
 
     // Helper: Attach local tracks to a peer connection (reuses existing sender or adds track with stream)
+    // Helper: Attach local tracks to a peer connection (matches transceivers or adds track)
     const attachLocalTracks = (pc: RTCPeerConnection) => {
         if (!localStreamRef.current) return;
 
         const localTracks = localStreamRef.current.getTracks();
-        const senders = pc.getSenders();
+        const transceivers = pc.getTransceivers();
 
         for (const track of localTracks) {
-            const existingSender = senders.find((s) => s.track && s.track.kind === track.kind);
-            if (existingSender) {
-                existingSender.replaceTrack(track).catch(console.warn);
+            // Find existing transceiver for this track kind
+            const matchedTransceiver = transceivers.find(
+                (t) => (t.receiver.track && t.receiver.track.kind === track.kind) ||
+                       (t.sender.track && t.sender.track.kind === track.kind)
+            );
+
+            if (matchedTransceiver && matchedTransceiver.sender) {
+                matchedTransceiver.direction = "sendrecv";
+                matchedTransceiver.sender.replaceTrack(track).catch(console.warn);
             } else {
                 try {
                     pc.addTrack(track, localStreamRef.current);
@@ -493,6 +483,26 @@ export default function MeetingRoom() {
                     console.warn(`addTrack warning for ${track.kind}:`, err);
                 }
             }
+        }
+    };
+
+    // Helper: Actively renegotiate ICE if a peer connection drops or fails
+    const restartIceForPeer = async (peerSocketId: string) => {
+        const pc = peersRef.current.get(peerSocketId);
+        if (!pc || pc.connectionState === "closed") return;
+        console.log(`🔄 Restarting ICE negotiation for peer ${peerSocketId}...`);
+        try {
+            attachLocalTracks(pc);
+            const offer = await pc.createOffer({ iceRestart: true });
+            await pc.setLocalDescription(offer);
+            socket.emit("sending-signal", {
+                userToSignal: peerSocketId,
+                callerId: socket.id,
+                callerUser: user || { _id: socket.id, fullName: "Participant" },
+                signal: offer
+            });
+        } catch (err) {
+            console.warn(`Failed to restart ICE with ${peerSocketId}:`, err);
         }
     };
 
@@ -505,7 +515,10 @@ export default function MeetingRoom() {
         const pc = new RTCPeerConnection(ICE_SERVERS);
         peersRef.current.set(targetSocketId, pc);
 
-        // Send gathered ICE candidate to peer
+        // Pre-attach local tracks if available so offer/answer contains both m=audio and m=video lines
+        attachLocalTracks(pc);
+
+        // Send gathered ICE candidate immediately (trickle ICE)
         pc.onicecandidate = (event) => {
             if (event.candidate) {
                 socket.emit("ice-candidate", {
@@ -515,36 +528,40 @@ export default function MeetingRoom() {
             }
         };
 
-        // Receive remote track (combines both audio and video into unified MediaStream with new reference)
+        // Receive remote track (combines audio and video into unified MediaStream with fresh reference)
         pc.ontrack = (event) => {
             console.log(`📡 Remote track received from ${targetSocketId}: kind=${event.track.kind}, id=${event.track.id}`);
-            const incomingStream = event.streams && event.streams[0] ? event.streams[0] : null;
             setRemoteStreams((prev) => {
-                let streamToUse: MediaStream;
-                if (incomingStream) {
-                    streamToUse = incomingStream;
-                } else {
-                    const currentStream = prev[targetSocketId];
-                    const existingTracks = currentStream ? currentStream.getTracks() : [];
-                    const otherTracks = existingTracks.filter((t) => t.id !== event.track.id && t.kind !== event.track.kind);
-                    streamToUse = new MediaStream([...otherTracks, event.track]);
+                const prevStream = prev[targetSocketId];
+                const trackMap = new Map<string, MediaStreamTrack>();
+
+                // 1. Preserve existing active tracks
+                if (prevStream) {
+                    prevStream.getTracks().forEach((t) => trackMap.set(t.kind, t));
                 }
+
+                // 2. Include tracks from the event stream if present
+                if (event.streams && event.streams[0]) {
+                    event.streams[0].getTracks().forEach((t) => trackMap.set(t.kind, t));
+                }
+
+                // 3. Put the newly arrived track (overwrites older track of same kind)
+                trackMap.set(event.track.kind, event.track);
+
+                // Construct a brand-new MediaStream so React detects reference change and re-renders RemoteVideoTile
+                const updatedStream = new MediaStream(Array.from(trackMap.values()));
                 return {
                     ...prev,
-                    [targetSocketId]: streamToUse
+                    [targetSocketId]: updatedStream
                 };
             });
         };
 
         pc.oniceconnectionstatechange = () => {
             console.log(`🧊 ICE State with ${targetSocketId}:`, pc.iceConnectionState);
-            if (pc.iceConnectionState === "failed") {
-                console.warn(`ICE failed with ${targetSocketId}, attempting restart...`);
-                try {
-                    pc.restartIce();
-                } catch (e) {
-                    console.warn("restartIce error:", e);
-                }
+            if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+                console.warn(`ICE state ${pc.iceConnectionState} with ${targetSocketId}, attempting restart...`);
+                restartIceForPeer(targetSocketId);
             }
         };
 
@@ -552,11 +569,7 @@ export default function MeetingRoom() {
             console.log(`🔌 Connection state with ${targetSocketId}:`, pc.connectionState);
             if (pc.connectionState === "failed") {
                 console.warn(`Connection state failed with ${targetSocketId}, restarting ICE...`);
-                try {
-                    pc.restartIce();
-                } catch (e) {
-                    console.warn("restartIce error:", e);
-                }
+                restartIceForPeer(targetSocketId);
             } else if (pc.connectionState === "closed") {
                 setRemoteStreams((prev) => {
                     const next = { ...prev };
