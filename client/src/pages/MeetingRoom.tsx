@@ -279,6 +279,7 @@ export default function MeetingRoom() {
     const [peers, setPeers] = useState<{ socketId: string; user: any }[]>([]);
     const [remoteStreams, setRemoteStreams] = useState<{ [socketId: string]: MediaStream }>({});
     const cleanupMeetingRef = useRef<() => void>(() => {});
+    const isStartingCameraRef = useRef<Promise<MediaStream | null> | null>(null);
 
     // Keep state refs in sync
     useEffect(() => {
@@ -289,91 +290,89 @@ export default function MeetingRoom() {
         micEnabledRef.current = micEnabled;
     }, [micEnabled]);
 
-    // 1. Camera & Microphone Initialization
-    const startCamera = async () => {
-        try {
-            let stream: MediaStream;
-            try {
-                // Request video & audio with ideal mobile & desktop settings
-                stream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        facingMode: "user",
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 }
-                    },
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true
-                    }
-                });
-            } catch (bothErr) {
-                console.warn("Could not access video+audio together, trying video only:", bothErr);
-                try {
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        video: true,
-                        audio: false
-                    });
-                } catch (vidErr) {
-                    console.warn("Could not access video, trying audio only:", vidErr);
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        video: false,
-                        audio: true
-                    });
-                }
-            }
-
-            localStreamRef.current = stream;
-            setLocalStream(stream);
-
-            const hasVideo = stream.getVideoTracks().length > 0 && stream.getVideoTracks()[0].enabled;
-            setCamEnabled(hasVideo);
-
-            const hasAudio = stream.getAudioTracks().length > 0 && stream.getAudioTracks()[0].enabled;
-            setMicEnabled(hasAudio);
-            micEnabledRef.current = hasAudio;
-
-            if (lobbyVideoRef.current) {
-                lobbyVideoRef.current.srcObject = stream;
-                lobbyVideoRef.current.play().catch(() => {});
-            }
-            if (localVideoRef.current) {
-                localVideoRef.current.srcObject = stream;
-                localVideoRef.current.play().catch(() => {});
-            }
-
-            // Replace tracks on any existing peer connections
-            peersRef.current.forEach((pc) => {
-                const transceivers = pc.getTransceivers();
-                stream.getTracks().forEach((track) => {
-                    const matchingTransceiver = transceivers.find((t) =>
-                        (t.sender.track && t.sender.track.kind === track.kind) ||
-                        (t.receiver.track && t.receiver.track.kind === track.kind)
-                    );
-                    if (matchingTransceiver) {
-                        matchingTransceiver.sender.replaceTrack(track).catch(console.warn);
-                        if (matchingTransceiver.direction !== "stopped") {
-                            matchingTransceiver.direction = "sendrecv";
-                        }
-                    } else {
-                        try {
-                            pc.addTrack(track, stream);
-                        } catch (e) {
-                            console.warn("addTrack error:", e);
-                        }
-                    }
-                });
-            });
-
-            return stream;
-        } catch (err: any) {
-            console.error("Camera access failed completely:", err);
-            toast.error("Could not access camera/mic. Please check browser permissions.");
-            setCamEnabled(false);
-            setMicEnabled(false);
-            micEnabledRef.current = false;
-            return null;
+    // 1. Camera & Microphone Initialization (Safe, idempotent, and concurrency-locked)
+    const startCamera = async (): Promise<MediaStream | null> => {
+        // If an active stream with live tracks already exists, reuse it immediately
+        if (localStreamRef.current && localStreamRef.current.getTracks().some((t) => t.readyState === "live")) {
+            return localStreamRef.current;
         }
+
+        if (isStartingCameraRef.current) {
+            return isStartingCameraRef.current;
+        }
+
+        const startPromise = (async () => {
+            try {
+                let stream: MediaStream;
+                try {
+                    // Request video & audio with fallback
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            facingMode: "user",
+                            width: { ideal: 1280 },
+                            height: { ideal: 720 }
+                        },
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        }
+                    });
+                } catch (bothErr) {
+                    console.warn("Could not access video+audio together, trying video only:", bothErr);
+                    try {
+                        stream = await navigator.mediaDevices.getUserMedia({
+                            video: true,
+                            audio: false
+                        });
+                    } catch (vidErr) {
+                        console.warn("Could not access video, trying audio only:", vidErr);
+                        stream = await navigator.mediaDevices.getUserMedia({
+                            video: false,
+                            audio: true
+                        });
+                    }
+                }
+
+                localStreamRef.current = stream;
+                setLocalStream(stream);
+
+                const hasVideo = stream.getVideoTracks().length > 0 && stream.getVideoTracks()[0].enabled;
+                setCamEnabled(hasVideo);
+
+                const hasAudio = stream.getAudioTracks().length > 0 && stream.getAudioTracks()[0].enabled;
+                setMicEnabled(hasAudio);
+                micEnabledRef.current = hasAudio;
+
+                if (lobbyVideoRef.current) {
+                    lobbyVideoRef.current.srcObject = stream;
+                    lobbyVideoRef.current.play().catch(() => {});
+                }
+                if (localVideoRef.current) {
+                    localVideoRef.current.srcObject = stream;
+                    localVideoRef.current.play().catch(() => {});
+                }
+
+                // Attach/replace tracks on any active peer connections
+                peersRef.current.forEach((pc) => {
+                    attachLocalTracks(pc);
+                });
+
+                return stream;
+            } catch (err: any) {
+                console.error("Camera access failed completely:", err);
+                toast.error("Could not access camera/mic. Please check browser permissions.");
+                setCamEnabled(false);
+                setMicEnabled(false);
+                micEnabledRef.current = false;
+                return null;
+            } finally {
+                isStartingCameraRef.current = null;
+            }
+        })();
+
+        isStartingCameraRef.current = startPromise;
+        return startPromise;
     };
 
     const stopCamera = () => {
@@ -400,7 +399,7 @@ export default function MeetingRoom() {
             socket.connect();
         }
         return () => {
-            stopCamera();
+            // Keep stream active across minor re-renders; torn down explicitly on exit/beforeunload
         };
     }, []);
 
@@ -475,30 +474,20 @@ export default function MeetingRoom() {
         }
     };
 
-    // Helper: Attach local tracks to a peer connection (matches existing transceivers or adds cleanly)
-    const attachLocalTracks = async (pc: RTCPeerConnection) => {
+    // Helper: Attach local tracks to a peer connection (reuses existing sender or adds track with stream)
+    const attachLocalTracks = (pc: RTCPeerConnection) => {
         if (!localStreamRef.current) return;
 
         const localTracks = localStreamRef.current.getTracks();
-        const transceivers = pc.getTransceivers();
+        const senders = pc.getSenders();
 
         for (const track of localTracks) {
-            const matchingTransceiver = transceivers.find((t) =>
-                (t.sender.track && t.sender.track.kind === track.kind) ||
-                (t.receiver.track && t.receiver.track.kind === track.kind)
-            );
-            if (matchingTransceiver) {
-                try {
-                    await matchingTransceiver.sender.replaceTrack(track);
-                    if (matchingTransceiver.direction !== "stopped") {
-                        matchingTransceiver.direction = "sendrecv";
-                    }
-                } catch (err) {
-                    console.warn(`replaceTrack error for ${track.kind}:`, err);
-                }
+            const existingSender = senders.find((s) => s.track && s.track.kind === track.kind);
+            if (existingSender) {
+                existingSender.replaceTrack(track).catch(console.warn);
             } else {
                 try {
-                    pc.addTrack(track, localStreamRef.current!);
+                    pc.addTrack(track, localStreamRef.current);
                 } catch (err) {
                     console.warn(`addTrack warning for ${track.kind}:`, err);
                 }
@@ -528,14 +517,20 @@ export default function MeetingRoom() {
         // Receive remote track (combines both audio and video into unified MediaStream with new reference)
         pc.ontrack = (event) => {
             console.log(`📡 Remote track received from ${targetSocketId}: kind=${event.track.kind}, id=${event.track.id}`);
+            const incomingStream = event.streams && event.streams[0] ? event.streams[0] : null;
             setRemoteStreams((prev) => {
-                const currentStream = prev[targetSocketId];
-                const existingTracks = currentStream ? currentStream.getTracks() : [];
-                const otherTracks = existingTracks.filter((t) => t.id !== event.track.id && t.kind !== event.track.kind);
-                const updatedTracks = [...otherTracks, event.track];
+                let streamToUse: MediaStream;
+                if (incomingStream) {
+                    streamToUse = incomingStream;
+                } else {
+                    const currentStream = prev[targetSocketId];
+                    const existingTracks = currentStream ? currentStream.getTracks() : [];
+                    const otherTracks = existingTracks.filter((t) => t.id !== event.track.id && t.kind !== event.track.kind);
+                    streamToUse = new MediaStream([...otherTracks, event.track]);
+                }
                 return {
                     ...prev,
-                    [targetSocketId]: new MediaStream(updatedTracks)
+                    [targetSocketId]: streamToUse
                 };
             });
         };
@@ -598,7 +593,7 @@ export default function MeetingRoom() {
             }
 
             const pc = createPeerConnection(peerSocketId);
-            await attachLocalTracks(pc);
+            attachLocalTracks(pc);
 
             pc.getTransceivers().forEach((transceiver) => {
                 if (transceiver.direction !== "stopped") {
@@ -655,8 +650,8 @@ export default function MeetingRoom() {
             // 1. Set remote description from incoming offer
             await pc.setRemoteDescription(new RTCSessionDescription(signal));
 
-            // 2. Attach local tracks to transceivers/senders and await
-            await attachLocalTracks(pc);
+            // 2. Attach local tracks to transceivers/senders
+            attachLocalTracks(pc);
 
             // 3. Ensure transceiver direction is bidirectional sendrecv
             pc.getTransceivers().forEach((transceiver) => {
@@ -840,6 +835,20 @@ export default function MeetingRoom() {
     const handleJoinRoom = async () => {
         if (!roomId) return;
         const cleanRoomId = normalizeRoomId(roomId);
+
+        // Resume AudioContext during user click gesture to permanently unlock audio autoplay
+        try {
+            const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+            if (AudioCtx) {
+                const ctx = new AudioCtx();
+                if (ctx.state === "suspended") {
+                    await ctx.resume();
+                }
+            }
+        } catch (e) {
+            console.warn("AudioContext unlock notice:", e);
+        }
+
         setInLobby(false);
         isInMeetingRef.current = true;
 
